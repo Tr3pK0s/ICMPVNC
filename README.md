@@ -122,7 +122,7 @@ The server auto detects all types. The client selects one.
 - 7000 & 10000 pps were the max I could get with zero packet loss testing arbitrary data on POS hardware, but livecapturing/compression/crypto will all limit anyway.
 - Actual throughput will depend heavily on screen content. A static desktop at scale 2 compresses to near zero deltas. Full motion content at scale 1 will saturate budget.
  
-##Trouble Shooting
+## Trouble Shooting
 - **"Cannot open X11 display"** — use `sudo -E` (not bare `sudo`)
 - **Fast motion/Low FPS** — increase rate (`-r 10000`), packet size (`-s 1400`), or scale up (`!quality 3`+)
 - **Corrupted image** — `!keyframe` forces a fresh full-frame download
