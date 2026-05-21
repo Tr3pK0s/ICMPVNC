@@ -40,7 +40,8 @@ User takes on full responsibility to use in a legal manner
 **Transport modes are cross compatible (XDP) server - (Raw) client  or  (Raw) server - (XDP) client**
 
 ### Server quick start
-- sudo -E python3 server.py -i eth0 --xdp -k <PSK>          (XDP transport) **XDP is primarily for eth0, only some drivers/adapters support wireless XDP**
+- sudo -E python3 server.py -i eth0 --xdp -k <PSK>          (XDP transport)
+- **XDP is primarily for eth0, only some drivers/adapters support wireless XDP**
 - sudo -E python3 server.py -i wlan0 --raw -k <PSK>          (raw transport)
 
 ### Server flags
