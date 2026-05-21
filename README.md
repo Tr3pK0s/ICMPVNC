@@ -115,7 +115,7 @@ The server auto detects all types. The client selects one.
 - `!keyframe` — force full frame download, clears delta state
 
 
-**!cursor command toggle disables server side cursor compositing. Reduces dirty rows per frame (cursor movement no longer dirties the delta). When hidden + VNC mode active, a white arrow overlay is drawn client-side**
+**!cursor command toggle disables server side cursor compositing, slightly boosting FPS. Reduces dirty rows per frame (cursor movement no longer dirties the delta). When hidden + VNC mode active, a white arrow overlay is drawn client-side**
 
 ## Bandwidth Limits
 - Theoretical max Raw 1400 bytes x 7000 pps = 9.8Mb/s
