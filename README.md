@@ -113,6 +113,8 @@ The server auto detects all types. The client selects one.
 - `!info` — server IP, transport, ICMP type, rate, packet size, crypto, resolution, uptime
 - `!bandwidth` — budget (rate×size), actual throughput, total transferred
 - `!keyframe` — force full frame download, clears delta state
+
+
 **!cursor command toggle disables server side cursor compositing. Reduces dirty rows per frame (cursor movement no longer dirties the delta). When hidden + VNC mode active, a white arrow overlay is drawn client-side**
 
 ## Bandwidth Limits
