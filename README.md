@@ -40,8 +40,8 @@ User takes on full responsibility to use in a legal manner
 **Transport modes are cross compatible (XDP) server - (Raw) client  or  (Raw) server - (XDP) client**
 
 ### Server quick start
-- sudo -E python3 server.py -i eth0 --xdp -k <PSK>          (XDP transport)
-- sudo -E python3 server.py -i wlan0 --raw -k <PSK>          (raw transport)
+- sudo -E python3 server.py -i eth0 --xdp -k PSK          (XDP transport)
+- sudo -E python3 server.py -i wlan0 --raw -k PSK          (raw transport)
 
  **XDP is primarily for eth0, only some drivers/adapters support wireless XDP**
 
@@ -58,10 +58,10 @@ User takes on full responsibility to use in a legal manner
 - -h, --help — Run 'python3 server.py --help' for help
 
 ### Client quick start
-- sudo python3 client.py <serverIP> -i wlan0 --raw -E -k <PSK>                    (Echo type)
-- sudo python3 client.py <serverIP> -i eth0 --xdp -X -k <PSK>                     (Experimental type)
-- sudo python3 client.py <serverIP> -i eth0 --xdp -E -k <PSK> -r 10000 -s 1400    (Theoretical max (XDP) 14.0Mb/s)
-- sudo python3 client.py <serverIP> -i wlan0 --raw -E -k <PSK> -r 7000 -s 1400    (Theoretical max (Raw) 9.8Mb/s)
+- sudo python3 client.py <serverIP> -i wlan0 --raw -E -k PSK                    (Echo type)
+- sudo python3 client.py <serverIP> -i eth0 --xdp -X -k PSK                     (Experimental type)
+- sudo python3 client.py <serverIP> -i eth0 --xdp -E -k PSK -r 10000 -s 1400    (Theoretical max (XDP) 14.0Mb/s)
+- sudo python3 client.py <serverIP> -i wlan0 --raw -E -k PSK -r 7000 -s 1400    (Theoretical max (Raw) 9.8Mb/s)
 
 ### Client Flags
 - -i, --interface — Network interface (auto detected if omitted)
