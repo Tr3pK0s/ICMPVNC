@@ -1,7 +1,7 @@
 # ICMPVNC ⛏
 
 ## Description/Overview
-This is a 100% ICMP based VNC, featuring screen sharing, full keyboard/mouse input, bidirectional file transfer, wide Linux compatibility using a multi capture engine designed to work for X11, Wayland, headless/ARM/VMs, along with a cross compatible raw or XDP (kernel bypass) tranport system crafted for usable FPS over many ICMP types.
+This is a 100% ICMP based VNC, featuring screen sharing, full keyboard & mouse input, bidirectional file transfer, varying display server compatibility using a multi capture engine designed for X11, Wayland, headless/ARM/VMs, along with a cross compatible raw or XDP (kernel bypass) tranport system crafted for usable FPS over many ICMP types.
 
 ## Features
 - A broad toolkit of many ICMP types (e.g., Echo, Timestamp, Traceroute)
@@ -115,7 +115,7 @@ The server auto detects all types. The client selects one.
 - `!keyframe` — force full frame download, clears delta state
 
 
-**!cursor command toggle disables server side cursor compositing, slightly boosting FPS. Reduces dirty rows per frame (cursor movement no longer dirties the delta). When hidden + VNC mode active, a white arrow overlay is drawn client-side**
+**!cursor command toggle disables server side cursor compositing, slightly boosting FPS. Reduces dirty rows per frame (cursor movement no longer dirties the delta). When hidden + VNC mode active, a white arrow overlay is drawn client side**
 
 ## Bandwidth Limits
 - Theoretical max Raw 1400 bytes x 7000 pps = 9.8Mb/s
@@ -127,7 +127,7 @@ The server auto detects all types. The client selects one.
 ## Trouble Shooting
 - **"Cannot open X11 display"** — use `sudo -E` (not bare `sudo`)
 - **Fast motion/Low FPS** — increase rate (`-r 10000`), packet size (`-s 1400`), or scale up (`!quality 3`+)
-- **Corrupted image** — `!keyframe` forces a fresh full-frame download
+- **Corrupted image** — `!keyframe` forces a fresh full frame download
 
 ## License 
 MIT License
