@@ -147,7 +147,6 @@ def _vlog(msg):
         print(f"  {_C.DIMW}[v] {msg}{_C.RST}")
 
 
-
 MAGIC        = b'\xCA\xFE'
 SESSION_ID   = 0x1111
 HANDSHAKE_ID = 0xBEEF
@@ -163,6 +162,10 @@ CMD_FILE_UP_HDR  = 0x32
 CMD_FILE_UP_DATA = 0x33
 CMD_INPUT_KEY    = 0x40
 CMD_INPUT_MOUSE  = 0x41
+CMD_SHELL_OPEN   = 0x50
+CMD_SHELL_INPUT  = 0x52
+CMD_SHELL_CLOSE  = 0x54
+CMD_PING       = 0x60
 MAX_PAYLOAD  = 1400
 MAX_RATE     = 10000
 ENCRYPT_OH   = 28
@@ -255,14 +258,12 @@ def _arp_read(ip):
     return None
 
 def _xor_apply(frame_ba, delta, offset=0):
-    """XOR delta into frame_ba at byte offset. For row-strip: offset = first_row * w * 3."""
     n = len(delta)
     ai = int.from_bytes(frame_ba[offset:offset+n], 'little')
     bi = int.from_bytes(delta, 'little')
     frame_ba[offset:offset+n] = (ai ^ bi).to_bytes(n, 'little')
 
 def validate_interface(iface):
-    """Check interface exists. If not, list available and exit cleanly."""
     sysnet = '/sys/class/net'
     if not os.path.isdir(os.path.join(sysnet, iface)):
         avail = sorted(d for d in os.listdir(sysnet) if d != 'lo') if os.path.isdir(sysnet) else []
@@ -283,12 +284,10 @@ def validate_interface(iface):
         pass
 
 def is_wireless(iface):
-    """Check if interface is wireless."""
     return (os.path.isdir(f'/sys/class/net/{iface}/wireless') or
             os.path.isdir(f'/sys/class/net/{iface}/phy80211'))
 
 def warn_wireless_xdp(iface):
-    """Warn user about XDP on wireless and prompt for confirmation."""
     print()
     _event("⚠", f"'{iface}' appears to be a wireless adapter.", _C.YELLOW)
     print(f"  {_C.DIMW}Most wireless drivers do NOT support native XDP.")
@@ -357,6 +356,9 @@ class Speck128_256:
             k.append((((k[i]<<3)|(k[i]>>61))&M)^li)
         self.rk = k
 
+class Speck128_256_Full(Speck128_256):
+    ROUNDS = 34
+
 class PrimeARX:
     PRIMES = [2,3,5,7,11,13,17,19,23,29,31,37,41,43,47,53]
     ROUNDS = 2
@@ -372,6 +374,9 @@ class PrimeARX:
         for i in range(self.ROUNDS):
             r1=self.PRIMES[i]&63; r2=self.PRIMES[(i+8)%16]&63
             self._rounds.append((r1,64-r1,r2,64-r2,rk[i]))
+
+class PrimeARX13(PrimeARX):
+    ROUNDS = 13
 
 def speck_ctr(speck, nonce, data):
     if not data: return b''
@@ -483,6 +488,67 @@ class CryptoV3:
     def max_plaintext(max_payload, proto_overhead):
         avail = max_payload - proto_overhead
         return max(0, avail - CryptoV3.RAW_OH)
+
+
+class CryptoV4:
+    NONCE_SZ = 12; MAC_SZ = 64; RAW_OH = 76
+
+    def __init__(self, psk):
+        self.psk = psk.encode('utf-8') if isinstance(psk, str) else psk
+        self.arx = None; self.speck = None
+        self.sha_key = None; self.mac_key = None
+        self.sub_fwd = None; self.sub_inv = None
+        self.tx_ctr = 0; self._rx_ctr = -1
+        self.dh_private = None; self.dh_public = None
+
+    def generate_dh(self):
+        self.dh_private, self.dh_public = x25519_keypair()
+        return self.dh_public
+
+    def derive(self, cn, sn, client_pub=None, server_pub=None):
+        if client_pub and server_pub and self.dh_private:
+            other = server_pub if client_pub == self.dh_public else client_pub
+            shared = x25519(self.dh_private, other)
+            self.dh_private = None
+            ikm = self.psk + shared
+        else:
+            ikm = self.psk
+        salt = cn + sn
+        prk = hmac.new(salt, ikm, hashlib.sha512).digest()
+        t = b''; okm = b''
+        for i in range(1, 6):
+            t = hmac.new(prk, t + b'icmpvnc-shell-v4' + bytes([i]), hashlib.sha512).digest()
+            okm += t
+        self.arx   = PrimeARX13(okm[0:32])
+        self.speck = Speck128_256_Full(okm[32:64])
+        self.sha_key = okm[64:96]
+        self.mac_key = okm[96:160]
+        self.sub_fwd, self.sub_inv = obf_sub_init(int.from_bytes(okm[160:168], 'big'))
+        self.tx_ctr = 0; self._rx_ctr = -1
+
+    def encrypt(self, data):
+        nonce = struct.pack('!I', 0) + struct.pack('!Q', self.tx_ctr); self.tx_ctr += 1
+        ct = obf_bitrev(data)
+        ct = obf_sub_enc(ct, self.sub_fwd)
+        ct = arx_ctr(self.arx, nonce, ct)
+        ct = speck_ctr(self.speck, nonce, ct)
+        ct = sha256_ctr(self.sha_key, nonce, ct)
+        tag = hmac.new(self.mac_key, nonce + ct, hashlib.sha512).digest()
+        return nonce + tag + ct
+
+    def decrypt(self, data):
+        if len(data) < self.RAW_OH: return None
+        nonce = data[:12]; tag = data[12:76]; ct = data[76:]
+        exp = hmac.new(self.mac_key, nonce + ct, hashlib.sha512).digest()
+        if not hmac.compare_digest(tag, exp): return None
+        ctr = struct.unpack('!Q', nonce[4:])[0]
+        if ctr <= self._rx_ctr: return None
+        self._rx_ctr = ctr
+        ct = sha256_ctr(self.sha_key, nonce, ct)
+        ct = speck_ctr(self.speck, nonce, ct)
+        ct = arx_ctr(self.arx, nonce, ct)
+        ct = obf_sub_dec(ct, self.sub_inv)
+        return obf_bitrev(ct)
 
 class RawTransport:
     def __init__(self, iface, server_ip):
@@ -748,7 +814,6 @@ def wrap_eth_ip(icmp, src_ip, dst_ip, src_mac, dst_mac):
     return dst_mac + src_mac + struct.pack('!H', ETH_P_IP) + ip_h + icmp
 
 def build_handshake(client_nonce, client_pub, icmp_type=8, has_id=True, magic_extra=0):
-    """VNC3 handshake with X25519 pubkey, using the chosen ICMP type."""
     payload = MAGIC + b'VNC3' + client_nonce + client_pub
     if has_id:
         hdr = struct.pack('!BBHHH', icmp_type, 0, 0, HANDSHAKE_ID, 0)
@@ -762,7 +827,6 @@ def build_handshake(client_nonce, client_pub, icmp_type=8, has_id=True, magic_ex
     return hdr[:2] + struct.pack('!H', cs) + hdr[4:] + extra + payload
 
 def _write_png(rgb_bytes, width, height, path):
-    """Write raw RGB bytes as a PNG file using only zlib."""
     def _chunk(ctype, data):
         c = ctype + data
         crc = zlib.crc32(c) & 0xFFFFFFFF
@@ -781,153 +845,181 @@ def _write_png(rgb_bytes, width, height, path):
         f.write(_chunk(b'IDAT', compressed))
         f.write(_chunk(b'IEND', b''))
 
-def _write_gif(frames, width, height, delay_ms, path):
-    """Write frames as animated GIF. frames = list of RGB bytes.
-    Uses median-cut quantization to 256 colors + LZW compression."""
-    if not frames: return
+GIF_MAX_W = 480
+GIF_FPS   = 5
 
-    def _quantize(rgb, w, h):
-        """Simple uniform quantization to 216 colors (6×6×6 cube)."""
-        palette = []
-        for r in range(6):
-            for g in range(6):
-                for b in range(6):
-                    palette.append(bytes([r*51, g*51, b*51]))
-        while len(palette) < 256:
-            palette.append(b'\x00\x00\x00')
-        pal_bytes = b''.join(palette)
-        indices = bytearray(w * h)
-        for i in range(w * h):
-            si = i * 3
-            pr = rgb[si]; pg = rgb[si+1]; pb = rgb[si+2]
-            ri = min(pr // 52, 5); gi = min(pg // 52, 5); bi = min(pb // 52, 5)
-            indices[i] = ri * 36 + gi * 6 + bi
-        return pal_bytes, indices
+def _downscale_rgb(rgb, sw, sh, dw, dh):
+    try:
+        import numpy as np
+        a = np.frombuffer(rgb, dtype=np.uint8).reshape(sh, sw, 3)
+        yi = (np.arange(dh) * sh // dh).astype(np.intp)
+        xi = (np.arange(dw) * sw // dw).astype(np.intp)
+        return bytes(a[np.ix_(yi, xi)].reshape(-1, 3))
+    except ImportError:
+        src = bytes(rgb); dst = bytearray(dw * dh * 3)
+        for dy in range(dh):
+            sy = dy * sh // dh; ro = sy * sw * 3; do = dy * dw * 3
+            for dx in range(dw):
+                sx = dx * sw // dw; si = ro + sx*3; di = do + dx*3
+                dst[di]=src[si]; dst[di+1]=src[si+1]; dst[di+2]=src[si+2]
+        return bytes(dst)
 
-    def _lzw(indices, min_code_size):
-        """LZW compress for GIF."""
-        clear = 1 << min_code_size
-        eoi = clear + 1
-        table = {}
-        for i in range(clear):
-            table[(i,)] = i
-        out_bits = []; code_size = min_code_size + 1
-        next_code = eoi + 1; max_code = (1 << code_size)
-        buf = 0; buf_len = 0; result = bytearray()
-        def emit(code):
-            nonlocal buf, buf_len
-            buf |= (code << buf_len); buf_len += code_size
-            while buf_len >= 8:
-                result.append(buf & 0xFF); buf >>= 8; buf_len -= 8
-        emit(clear)
-        w = (indices[0],) if indices else ()
-        for px in indices[1:]:
-            wp = w + (px,)
-            if wp in table:
-                w = wp
-            else:
-                emit(table[w])
-                if next_code < 4096:
-                    table[wp] = next_code; next_code += 1
-                    if next_code > max_code and code_size < 12:
-                        code_size += 1; max_code = 1 << code_size
-                else:
-                    emit(clear)
-                    table = {}
-                    for i in range(clear): table[(i,)] = i
-                    next_code = eoi + 1; code_size = min_code_size + 1
-                    max_code = 1 << code_size
-                w = (px,)
-        if w: emit(table[w])
+def _quantize_rgb(rgb, n_px):
+    pal = bytearray(768)
+    i = 0
+    for r in range(6):
+        for g in range(6):
+            for b in range(6):
+                pal[i]=r*51; pal[i+1]=g*51; pal[i+2]=b*51; i+=3
+    try:
+        import numpy as np
+        a = np.frombuffer(rgb, dtype=np.uint8)[:n_px*3].reshape(n_px, 3)
+        ri = np.minimum(a[:,0].astype(np.uint16)//52, 5)
+        gi = np.minimum(a[:,1].astype(np.uint16)//52, 5)
+        bi = np.minimum(a[:,2].astype(np.uint16)//52, 5)
+        idx = bytes((ri*36 + gi*6 + bi).astype(np.uint8))
+    except ImportError:
+        idx = bytearray(n_px)
+        for j in range(n_px):
+            s=j*3
+            idx[j]=(min(rgb[s]//52,5)*36+min(rgb[s+1]//52,5)*6+min(rgb[s+2]//52,5))
+        idx = bytes(idx)
+    return bytes(pal), idx
+
+def _lzw_encode(indices, min_cs):
+    clear=1<<min_cs; eoi=clear+1
+    cs=min_cs+1; mc=1<<cs; nc=eoi+1
+    tbl={}; buf=0; bl=0; out=bytearray()
+    def emit(c):
+        nonlocal buf,bl
+        buf|=c<<bl; bl+=cs
+        while bl>=8: out.append(buf&0xFF); buf>>=8; bl-=8
+    emit(clear)
+    data = bytes(indices)
+    if not data:
         emit(eoi)
-        if buf_len > 0: result.append(buf & 0xFF)
-        return bytes(result)
+        if bl: out.append(buf&0xFF)
+        return bytes(out)
+    prefix = data[0]
+    for px in data[1:]:
+        key=(prefix<<8)|px
+        if key in tbl:
+            prefix=tbl[key]
+        else:
+            emit(prefix)
+            if nc<4096:
+                tbl[key]=nc; nc+=1
+                if nc>mc and cs<12: cs+=1; mc<<=1
+            else:
+                emit(clear); tbl={}; nc=eoi+1; cs=min_cs+1; mc=1<<cs
+            prefix=px
+    emit(prefix); emit(eoi)
+    if bl: out.append(buf&0xFF)
+    return bytes(out)
 
-    delay = delay_ms // 10
-    with open(path, 'wb') as f:
+def _write_gif(frames, width, height, delay_ms, path):
+    if not frames: return
+    delay=max(2,delay_ms//10); n_px=width*height
+    with open(path,'wb') as f:
         f.write(b'GIF89a')
-        f.write(struct.pack('<HH', width, height))
-        f.write(bytes([0xF7, 0, 0]))
-        pal0, _ = _quantize(frames[0], width, height)
-        f.write(pal0)
-        f.write(b'\x21\xFF\x0BNETSCAPE2.0\x03\x01\x00\x00\x00')
+        f.write(struct.pack('<HH',width,height))
+        f.write(b'\xf7\x00\x00')
+        pal0,_=_quantize_rgb(frames[0],n_px); f.write(pal0)
+        f.write(b'\x21\xff\x0bNETSCAPE2.0\x03\x01\x00\x00\x00')
         for rgb in frames:
-            pal, indices = _quantize(rgb, width, height)
-            f.write(b'\x21\xF9\x04\x00')
-            f.write(struct.pack('<H', delay))
-            f.write(b'\x00\x00')
-            f.write(b'\x2C')
-            f.write(struct.pack('<HHHH', 0, 0, width, height))
-            f.write(bytes([0x87]))
-            f.write(pal)
-            min_code = 8
-            f.write(bytes([min_code]))
-            lzw_data = _lzw(indices, min_code)
-            for i in range(0, len(lzw_data), 255):
-                blk = lzw_data[i:i+255]
-                f.write(bytes([len(blk)])); f.write(blk)
+            pal,idx=_quantize_rgb(rgb,n_px)
+            lzw=_lzw_encode(idx,8)
+            f.write(b'\x21\xf9\x04\x00')
+            f.write(struct.pack('<H',delay))
+            f.write(b'\x00\x00\x2c')
+            f.write(struct.pack('<HHHH',0,0,width,height))
+            f.write(b'\x87'); f.write(pal); f.write(b'\x08')
+            for i in range(0,len(lzw),255):
+                blk=lzw[i:i+255]; f.write(bytes([len(blk)])); f.write(blk)
             f.write(b'\x00')
-        f.write(b'\x3B')
+        f.write(b'\x3b')
 
 class FrameRecorder:
-    """Records mirrored screen frames (not client window)."""
     def __init__(self, width, height):
-        self.width = width; self.height = height
-        self.recording = False; self.gif_mode = False
-        self.gif_seconds = 0; self.gif_start = 0
-        self.frames = []; self.frame_times = []
-        self.rec_dir = None; self.frame_count = 0
+        self.width=width; self.height=height
+        self.recording=False; self.gif_mode=False
+        self.gif_seconds=0; self.gif_start=0
+        self.gif_width=0; self.gif_height=0
+        self.frames=[]; self.frame_times=[]
+        self.rec_dir=None; self.frame_count=0
+        self._log_fn=None
 
     def start(self):
-        ts = time.strftime('%Y%m%d_%H%M%S')
-        self.rec_dir = f'icmpvnc_rec_{ts}'
-        os.makedirs(self.rec_dir, exist_ok=True)
-        self.recording = True; self.gif_mode = False
-        self.frame_count = 0
+        ts=time.strftime('%Y%m%d_%H%M%S')
+        self.rec_dir=f'icmpvnc_rec_{ts}'
+        os.makedirs(self.rec_dir,exist_ok=True)
+        self.recording=True; self.gif_mode=False; self.frame_count=0
         return self.rec_dir
 
     def start_gif(self, seconds):
-        self.recording = True; self.gif_mode = True
-        self.gif_seconds = seconds; self.gif_start = time.time()
-        self.frames = []; self.frame_times = []
+        self.recording=True; self.gif_mode=True
+        self.gif_seconds=seconds; self.gif_start=time.time()
+        self.frames=[]; self.frame_times=[]
+        self.gif_width=0; self.gif_height=0
         return seconds
 
     def stop(self):
-        self.recording = False
-        if self.gif_mode and self.frames:
-            return self._save_gif()
+        self.recording=False
+        if self.gif_mode and self.frames: return self._save_gif()
         if self.rec_dir:
-            r = self.rec_dir; self.rec_dir = None
+            r=self.rec_dir; self.rec_dir=None
             return f"{r}/ ({self.frame_count} frames)"
         return None
 
     def add_frame(self, rgb_bytes):
         if not self.recording: return None
         if self.gif_mode:
-            self.frames.append(bytes(rgb_bytes))
-            self.frame_times.append(time.time())
-            if time.time() - self.gif_start >= self.gif_seconds:
-                return self.stop()
+            now=time.time()
+            if self.frame_times and now-self.frame_times[-1] < 1.0/GIF_FPS:
+                if now-self.gif_start < self.gif_seconds: return None
+            w,h=self.width,self.height
+            if not w or not h: return None
+            if not self.gif_width:
+                if w>GIF_MAX_W:
+                    self.gif_width=GIF_MAX_W
+                    self.gif_height=max(1,h*GIF_MAX_W//w)
+                else:
+                    self.gif_width=w; self.gif_height=h
+            if w!=self.gif_width or h!=self.gif_height:
+                frame=_downscale_rgb(rgb_bytes,w,h,self.gif_width,self.gif_height)
+            else:
+                frame=bytes(rgb_bytes)
+            self.frames.append(frame); self.frame_times.append(now)
+            if now-self.gif_start>=self.gif_seconds: return self.stop()
         else:
-            path = os.path.join(self.rec_dir, f'frame_{self.frame_count:06d}.png')
-            _write_png(rgb_bytes, self.width, self.height, path)
-            self.frame_count += 1
+            path=os.path.join(self.rec_dir,f'frame_{self.frame_count:06d}.png')
+            _write_png(rgb_bytes,self.width,self.height,path)
+            self.frame_count+=1
         return None
 
     def _save_gif(self):
-        if len(self.frames) < 2: return None
-        avg_dt = (self.frame_times[-1] - self.frame_times[0]) / max(len(self.frames) - 1, 1)
-        delay_ms = max(20, int(avg_dt * 1000))
-        ts = time.strftime('%Y%m%d_%H%M%S')
-        path = f'icmpvnc_{ts}.gif'
-        _write_gif(self.frames, self.width, self.height, delay_ms, path)
-        n = len(self.frames)
-        self.frames = []; self.gif_mode = False; self.recording = False
-        return f"{path} ({n} frames, {delay_ms}ms delay)"
+        frames=self.frames; times=self.frame_times; n=len(frames)
+        if n<2:
+            self.frames=[]; self.gif_mode=False; self.recording=False
+            return "[!] GIF: too few frames captured (need ≥2)"
+        w=self.gif_width; h=self.gif_height
+        avg_dt=(times[-1]-times[0])/max(n-1,1)
+        delay_ms=max(20,int(avg_dt*1000))
+        ts=time.strftime('%Y%m%d_%H%M%S')
+        path=f'icmpvnc_{ts}.gif'
+        self.frames=[]; self.gif_mode=False; self.recording=False
+        log=self._log_fn
+        if log: log(f"[*] Encoding {n} frames ({w}x{h}, {delay_ms}ms/frame)...")
+        def _encode():
+            try:
+                _write_gif(frames,w,h,delay_ms,path)
+                if log: log(f"[*] GIF saved: {path} ({n} frames)")
+            except Exception as e:
+                if log: log(f"[!] GIF encode error: {e}")
+        threading.Thread(target=_encode,daemon=True,name='GIFEncode').start()
+        return f"[*] Encoding {n} frames → {path}"
 
 class FrameViewer:
-    """Split-window viewer: screen fills all space above console, centered.
-    Console area has stats bar, scrollable log, and command input."""
     def __init__(self, width, height, cmd_callback=None, input_callback=None):
         self.width = width; self.height = height
         self.running = True; self._shutdown = False
@@ -964,7 +1056,14 @@ class FrameViewer:
         import tkinter as tk
         from tkinter import scrolledtext
         self._tk = tk
-        root = tk.Tk()
+        try:
+            root = tk.Tk()
+        except Exception as e:
+            _vlog(f"FrameViewer: Tk() failed: {e}")
+            _vlog("  Tip: use --mobile for SDL2 display, or --headless for no display")
+            self.running = False
+            self._ready.set()
+            return
         self._root = root
         root.title(f"ICMPVNC — {self.width}x{self.height}")
         root.configure(bg='#0f0f23')
@@ -1038,7 +1137,6 @@ class FrameViewer:
         self.running = False
 
     def _on_canvas_resize(self, event):
-        """Keep image centered in canvas on every resize."""
         cx = event.width // 2; cy = event.height // 2
         try: self._canvas.coords(self._img_id, cx, cy)
         except: pass
@@ -1079,7 +1177,7 @@ class FrameViewer:
                     self._photo = src
                     self._display_w = src.width(); self._display_h = src.height()
                     self._canvas.itemconfigure(self._img_id, image=self._photo)
-                    self._root.title(f"ICMPVNC \u2014 {self.width}x{self.height}")
+                    self._root.title(f"ICMPVNC — {self.width}x{self.height}")
                 except: pass
         try: self._root.after(16, self._check_frame)
         except: pass
@@ -1148,13 +1246,11 @@ class FrameViewer:
         except: pass
 
     def _on_close(self):
-        """User clicked X — signal shutdown, quit mainloop from tk thread."""
         self.running = False; self._shutdown = True
         try: self._root.quit()
         except: pass
 
     def close(self):
-        """Called from main thread — signal tk thread to exit and wait."""
         if not self._tk_thread.is_alive(): return
         self._shutdown = True
         self._new_frame.set()
@@ -1192,7 +1288,6 @@ class FrameViewer:
         except: pass
 
     def exit_vnc_mode(self):
-        """Exit VNC mode — release all held keys, restore cursor, refocus console."""
         if not self._vnc_active: return
         self._vnc_active = False
         self._local_cursor = False
@@ -1217,14 +1312,12 @@ class FrameViewer:
         except: pass
 
     def _on_vnc_focusout(self, event):
-        """Prevent focus from leaving canvas during VNC mode."""
         if self._vnc_active:
             try: self._root.after(1, self._canvas.focus_set)
             except: pass
         return 'break'
 
     def set_local_cursor(self, enabled):
-        """Toggle between local client cursor and server-composited cursor."""
         self._local_cursor = enabled
         try:
             if enabled and self._cursor_id is not None:
@@ -1242,7 +1335,6 @@ class FrameViewer:
         except: pass
 
     def _canvas_to_frame(self, cx, cy):
-        """Convert canvas pixel coords to frame-space coords (0..width, 0..height)."""
         try:
             cw = self._canvas.winfo_width()
             ch = self._canvas.winfo_height()
@@ -1333,6 +1425,358 @@ class FrameViewer:
             self._input_callback(0x41, struct.pack('!BHHB', 3, fx, fy, btn))
         return 'break'
 
+class MobileFrameViewer:
+    SDL_INIT_VIDEO           = 0x00000020
+    SDL_WINDOW_FULLSCREEN    = 0x00000001
+    SDL_WINDOW_SHOWN         = 0x00000004
+    SDL_WINDOW_ALLOW_HIGHDPI = 0x00002000
+    SDL_PIXELFORMAT_RGB24    = 0x17101803
+    SDL_TEXTUREACCESS_STREAMING = 1
+    SDL_RENDERER_ACCELERATED = 0x00000002
+    SDL_RENDERER_PRESENTVSYNC= 0x00000004
+    SDL_QUIT        = 0x100
+    SDL_KEYDOWN     = 0x300
+    SDL_KEYUP       = 0x301
+    SDL_TEXTINPUT   = 0x303
+    SDL_FINGERDOWN  = 0x700
+    SDL_FINGERUP    = 0x701
+    SDL_FINGERMOTION= 0x702
+    SDLK_ESCAPE     = 27
+    SDLK_BACKSPACE  = 8
+
+    def __init__(self, width, height, input_callback=None):
+        self.width = width; self.height = height
+        self._input_callback = input_callback
+        self.running = True
+        self._frame_data = None
+        self._frame_lock = threading.Lock()
+        self._new_frame = threading.Event()
+        self._ready = threading.Event()
+        self._shutdown = False
+        self._stats_text = ''
+        self._touch_down_time = 0.0
+        self._touch_down_x = 0.0; self._touch_down_y = 0.0
+        self._touch_active = False
+        self._last_tap_time = 0.0
+        self._long_press_threshold = 0.6
+        self._double_tap_threshold = 0.35
+        self._drag_threshold = 0.02
+        self._sdl = None; self._win = None; self._ren = None; self._tex = None
+        self._win_w = width; self._win_h = height
+        self._sdl_thread = threading.Thread(target=self._sdl_loop, daemon=False)
+        self._sdl_thread.start()
+        self._ready.wait(timeout=10)
+        if not self._ready.is_set():
+            raise RuntimeError("MobileFrameViewer: SDL2 init timed out")
+        if not self.running:
+            raise RuntimeError("MobileFrameViewer: SDL2 failed to start — see log above")
+
+    def _load_sdl(self):
+        for name in ('libSDL2.so', 'libSDL2-2.0.so.0', 'libSDL2-2.0.so',
+                     '/data/data/com.termux/files/usr/lib/libSDL2.so',
+                     '/data/data/com.termux/files/usr/lib/libSDL2-2.0.so.0'):
+            try:
+                lib = ctypes.CDLL(name)
+                lib.SDL_GetError.restype = ctypes.c_char_p
+                return lib
+            except OSError:
+                continue
+        return None
+
+    def _setup_sdl_sigs(self, sdl):
+        sdl.SDL_Init.argtypes = [ctypes.c_uint32]; sdl.SDL_Init.restype = ctypes.c_int
+        sdl.SDL_Quit.argtypes = []; sdl.SDL_Quit.restype = None
+        sdl.SDL_GetError.restype = ctypes.c_char_p
+        sdl.SDL_CreateWindow.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int,
+                                          ctypes.c_int, ctypes.c_int, ctypes.c_uint32]
+        sdl.SDL_CreateWindow.restype = ctypes.c_void_p
+        sdl.SDL_DestroyWindow.argtypes = [ctypes.c_void_p]; sdl.SDL_DestroyWindow.restype = None
+        sdl.SDL_CreateRenderer.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint32]
+        sdl.SDL_CreateRenderer.restype = ctypes.c_void_p
+        sdl.SDL_DestroyRenderer.argtypes = [ctypes.c_void_p]; sdl.SDL_DestroyRenderer.restype = None
+        sdl.SDL_CreateTexture.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                           ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        sdl.SDL_CreateTexture.restype = ctypes.c_void_p
+        sdl.SDL_DestroyTexture.argtypes = [ctypes.c_void_p]; sdl.SDL_DestroyTexture.restype = None
+        sdl.SDL_UpdateTexture.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                           ctypes.c_void_p, ctypes.c_int]
+        sdl.SDL_UpdateTexture.restype = ctypes.c_int
+        sdl.SDL_RenderClear.argtypes = [ctypes.c_void_p]; sdl.SDL_RenderClear.restype = ctypes.c_int
+        sdl.SDL_RenderCopy.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                        ctypes.c_void_p, ctypes.c_void_p]
+        sdl.SDL_RenderCopy.restype = ctypes.c_int
+        sdl.SDL_RenderPresent.argtypes = [ctypes.c_void_p]; sdl.SDL_RenderPresent.restype = None
+        sdl.SDL_PollEvent.argtypes = [ctypes.c_void_p]; sdl.SDL_PollEvent.restype = ctypes.c_int
+        sdl.SDL_StartTextInput.argtypes = []; sdl.SDL_StartTextInput.restype = None
+        sdl.SDL_StopTextInput.argtypes = []; sdl.SDL_StopTextInput.restype = None
+        sdl.SDL_GetWindowSize.argtypes = [ctypes.c_void_p,
+                                           ctypes.POINTER(ctypes.c_int),
+                                           ctypes.POINTER(ctypes.c_int)]
+        sdl.SDL_GetWindowSize.restype = None
+
+    def _sdl_loop(self):
+        sdl = self._load_sdl()
+        if sdl is None:
+            _event("!", "libSDL2 not found — display unavailable, falling back to headless.", _C.GOLD)
+            _event("!", "Install: pkg install libsdl2  (Termux)", _C.DIM)
+            _event("!", "        apt install libsdl2-2.0-0  (NetHunter chroot)", _C.DIM)
+            self._ready.set(); self.running = False; return
+        self._setup_sdl_sigs(sdl); self._sdl = sdl
+        if sdl.SDL_Init(self.SDL_INIT_VIDEO) != 0:
+            _vlog(f"SDL_Init failed: {sdl.SDL_GetError()}")
+            self._ready.set(); self.running = False; return
+        flags = self.SDL_WINDOW_FULLSCREEN | self.SDL_WINDOW_SHOWN | self.SDL_WINDOW_ALLOW_HIGHDPI
+        win = sdl.SDL_CreateWindow(b"ICMPVNC", 0, 0, self.width, self.height, flags)
+        if not win:
+            _vlog(f"SDL_CreateWindow failed: {sdl.SDL_GetError()}")
+            sdl.SDL_Quit(); self._ready.set(); self.running = False; return
+        self._win = win
+        aw = ctypes.c_int(0); ah = ctypes.c_int(0)
+        sdl.SDL_GetWindowSize(win, ctypes.byref(aw), ctypes.byref(ah))
+        self._win_w = aw.value or self.width; self._win_h = ah.value or self.height
+        ren = sdl.SDL_CreateRenderer(win, -1,
+                                     self.SDL_RENDERER_ACCELERATED | self.SDL_RENDERER_PRESENTVSYNC)
+        if not ren: ren = sdl.SDL_CreateRenderer(win, -1, 0)
+        if not ren:
+            _vlog(f"SDL_CreateRenderer failed: {sdl.SDL_GetError()}")
+            sdl.SDL_DestroyWindow(win); sdl.SDL_Quit()
+            self._ready.set(); self.running = False; return
+        self._ren = ren
+        tex = sdl.SDL_CreateTexture(ren, self.SDL_PIXELFORMAT_RGB24,
+                                     self.SDL_TEXTUREACCESS_STREAMING,
+                                     self.width, self.height)
+        if not tex:
+            _vlog(f"SDL_CreateTexture failed: {sdl.SDL_GetError()}")
+            sdl.SDL_DestroyRenderer(ren); sdl.SDL_DestroyWindow(win); sdl.SDL_Quit()
+            self._ready.set(); self.running = False; return
+        self._tex = tex
+        EVENT_SIZE = 56
+        event_buf = (ctypes.c_uint8 * EVENT_SIZE)()
+        self._ready.set()
+        _vlog(f"MobileFrameViewer: SDL2 ready {self._win_w}x{self._win_h}")
+        while not self._shutdown:
+            while sdl.SDL_PollEvent(event_buf):
+                self._handle_sdl_event(struct.unpack_from('<I', bytes(event_buf), 0)[0],
+                                       bytes(event_buf))
+            if self._new_frame.is_set():
+                self._new_frame.clear()
+                with self._frame_lock:
+                    frame = self._frame_data
+                if frame: self._blit(frame)
+            time.sleep(0.008)
+        try:
+            if self._tex: sdl.SDL_DestroyTexture(self._tex)
+            if self._ren: sdl.SDL_DestroyRenderer(self._ren)
+            if self._win: sdl.SDL_DestroyWindow(self._win)
+            sdl.SDL_Quit()
+        except: pass
+        self.running = False
+
+    def _blit(self, rgb_bytes):
+        sdl = self._sdl
+        if not sdl or not self._tex or not self._ren: return
+        try:
+            src = (ctypes.c_uint8 * len(rgb_bytes)).from_buffer_copy(rgb_bytes)
+            sdl.SDL_UpdateTexture(self._tex, None, src, self.width * 3)
+            sdl.SDL_RenderClear(self._ren)
+            sdl.SDL_RenderCopy(self._ren, self._tex, None, None)
+            sdl.SDL_RenderPresent(self._ren)
+        except Exception as e:
+            _vlog(f"MobileFrameViewer blit error: {e}")
+
+    def _handle_sdl_event(self, etype, raw):
+        if etype == self.SDL_QUIT:
+            self._shutdown = True; self.running = False; return
+        elif etype == self.SDL_KEYDOWN:
+            sym = struct.unpack_from('<i', raw, 20)[0]
+            if sym == self.SDLK_ESCAPE:
+                self._shutdown = True; self.running = False
+            elif sym == self.SDLK_BACKSPACE:
+                if self._input_callback:
+                    self._input_callback(CMD_INPUT_KEY, struct.pack('!BI', 1, 0xff08))
+                    self._input_callback(CMD_INPUT_KEY, struct.pack('!BI', 0, 0xff08))
+        elif etype == self.SDL_TEXTINPUT:
+            text = raw[12:44].split(b'\x00')[0].decode('utf-8', 'replace')
+            if self._input_callback:
+                for ch in text:
+                    ks = ord(ch)
+                    self._input_callback(CMD_INPUT_KEY, struct.pack('!BI', 1, ks))
+                    self._input_callback(CMD_INPUT_KEY, struct.pack('!BI', 0, ks))
+        elif etype in (self.SDL_FINGERDOWN, self.SDL_FINGERUP, self.SDL_FINGERMOTION):
+            fx = struct.unpack_from('<f', raw, 24)[0]
+            fy = struct.unpack_from('<f', raw, 28)[0]
+            px = max(0, min(int(fx * self.width),  self.width  - 1))
+            py = max(0, min(int(fy * self.height), self.height - 1))
+            now = time.time()
+            if etype == self.SDL_FINGERDOWN:
+                self._touch_down_time = now
+                self._touch_down_x = fx; self._touch_down_y = fy
+                self._touch_active = True
+                if self._input_callback:
+                    self._input_callback(CMD_INPUT_MOUSE, struct.pack('!BHHB', 0, px, py, 0))
+            elif etype == self.SDL_FINGERMOTION:
+                if self._touch_active and self._input_callback:
+                    if (abs(fx - self._touch_down_x) > self._drag_threshold or
+                            abs(fy - self._touch_down_y) > self._drag_threshold):
+                        self._input_callback(CMD_INPUT_MOUSE, struct.pack('!BHHB', 0, px, py, 0))
+            elif etype == self.SDL_FINGERUP:
+                if not self._touch_active: return
+                self._touch_active = False
+                hold = now - self._touch_down_time
+                dx = abs(fx - self._touch_down_x); dy = abs(fy - self._touch_down_y)
+                is_tap = (dx < self._drag_threshold and dy < self._drag_threshold
+                          and hold < self._long_press_threshold)
+                if hold >= self._long_press_threshold:
+                    if self._input_callback:
+                        self._input_callback(CMD_INPUT_MOUSE, struct.pack('!BHHB', 1, px, py, 3))
+                        self._input_callback(CMD_INPUT_MOUSE, struct.pack('!BHHB', 2, px, py, 3))
+                elif is_tap:
+                    if now - self._last_tap_time < self._double_tap_threshold:
+                        if self._sdl: self._sdl.SDL_StartTextInput()
+                        self._last_tap_time = 0.0
+                    else:
+                        self._last_tap_time = now
+                        if self._input_callback:
+                            self._input_callback(CMD_INPUT_MOUSE, struct.pack('!BHHB', 1, px, py, 1))
+                            self._input_callback(CMD_INPUT_MOUSE, struct.pack('!BHHB', 2, px, py, 1))
+                else:
+                    if self._input_callback:
+                        self._input_callback(CMD_INPUT_MOUSE, struct.pack('!BHHB', 2, px, py, 1))
+
+    def update(self, rgb_bytes):
+        if self._shutdown: return
+        with self._frame_lock: self._frame_data = bytes(rgb_bytes)
+        self._new_frame.set()
+
+    def set_stats(self, text): self._stats_text = text
+
+    def log(self, msg):
+        sys.stdout.write(f"\r\033[K{msg}\n"); sys.stdout.flush()
+
+    def is_alive(self): return self.running and self._sdl_thread.is_alive()
+
+    def close(self):
+        self._shutdown = True; self._new_frame.set()
+        self._sdl_thread.join(timeout=3); self.running = False
+
+    def toggle_fullscreen(self): pass
+    def enter_vnc_mode(self, **_): pass
+    def exit_vnc_mode(self): pass
+    def set_local_cursor(self, _): pass
+
+
+class HeadlessCLI:
+    def __init__(self, cmd_callback=None, shell_input_queue=None):
+        self._cmd_callback = cmd_callback
+        self._shell_input_queue = shell_input_queue
+        self.running = True
+        self.shell_mode = False
+        self._fit_mode = False
+        self._is_fullscreen = False
+        self._zoom = 100
+        self.width = 0
+        self.height = 0
+        self._lock = threading.Lock()
+        self._stats = ''
+        self._thread = threading.Thread(target=self._stdin_loop, daemon=True, name='HeadlessCLI')
+        self._thread.start()
+
+    def _stdin_loop(self):
+        sys.stdout.write('[*] Headless CLI — !help for commands, Ctrl+C to quit\n')
+        sys.stdout.write('[*] !screenshot !record start|stop|gif <s> !dl <path> !ul <path> !ping !keyframe !quality <1-6> !shell\n')
+        sys.stdout.write('\n')
+        sys.stdout.write('icmpvnc> ')
+        sys.stdout.flush()
+        while self.running:
+            try:
+                line = sys.stdin.readline()
+                if not line:
+                    self.running = False; break
+                line_stripped = line.strip()
+                if not line_stripped:
+                    if not self.shell_mode:
+                        with self._lock:
+                            sys.stdout.write(f'\r\033[K{self._stats}\n\r\033[Kicmpvnc> ')
+                            sys.stdout.flush()
+                    continue
+
+                if self.shell_mode:
+                    if line_stripped == '!exit':
+                        if self._cmd_callback:
+                            result = self._cmd_callback('!exit')
+                            if result:
+                                sys.stdout.write(f'\n{result}\n')
+                                sys.stdout.flush()
+                        if not self.shell_mode:
+                            with self._lock:
+                                sys.stdout.write(f'\r\033[K{self._stats}\n\r\033[Kicmpvnc> ')
+                                sys.stdout.flush()
+                    elif line_stripped.startswith('!'):
+                        if self._cmd_callback:
+                            result = self._cmd_callback(line_stripped)
+                            if result:
+                                sys.stdout.write(f'\n{result}\n')
+                                sys.stdout.flush()
+                    else:
+                        if self._shell_input_queue is not None:
+                            self._shell_input_queue.append(line.encode().rstrip(b'\n') + b'\n')
+                else:
+                    if not line_stripped.startswith('!'):
+                        sys.stdout.write('[!] Use !shell to open a shell, or !help for commands\n')
+                        sys.stdout.flush()
+                    elif self._cmd_callback:
+                        result = self._cmd_callback(line_stripped)
+                        if result:
+                            with self._lock:
+                                sys.stdout.write(f'\n{result}\n')
+                                sys.stdout.flush()
+                    with self._lock:
+                        if not self.shell_mode:
+                            sys.stdout.write(f'\r\033[K{self._stats}\n\r\033[Kicmpvnc> ')
+                            sys.stdout.flush()
+            except KeyboardInterrupt:
+                if self.shell_mode:
+                    if self._shell_input_queue is not None:
+                        self._shell_input_queue.append(b'\x03')
+                else:
+                    self.running = False; break
+            except Exception as e:
+                with self._lock:
+                    sys.stdout.write(f'\n[!] {e}\n\r\033[K{self._stats}\n\r\033[Kicmpvnc> ')
+                    sys.stdout.flush()
+
+    def set_stats(self, text):
+        with self._lock:
+            self._stats = text
+            if not self.shell_mode:
+                sys.stdout.write(f'\033[s\r\033[1A\r\033[K{text}\033[u')
+                sys.stdout.flush()
+
+    def log(self, msg):
+        with self._lock:
+            if self.shell_mode:
+                sys.stdout.write(f'\n{msg}\n')
+            else:
+                sys.stdout.write(f'\r\033[K\033[1A\r\033[K{msg}\n{self._stats}\n\r\033[Kicmpvnc> ')
+            sys.stdout.flush()
+
+    def write_shell_output(self, data):
+        try:
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+        except Exception:
+            sys.stdout.write(data.decode('utf-8', errors='replace'))
+            sys.stdout.flush()
+
+    def update(self, rgb_bytes): pass
+    def toggle_fullscreen(self): pass
+    def enter_vnc_mode(self, **_): pass
+    def exit_vnc_mode(self): pass
+    def set_local_cursor(self, _): pass
+    def is_alive(self): return self.running and self._thread.is_alive()
+    def close(self): self.running = False
+
+
 class ICMPVNCClient:
     def __init__(self, args, psk):
         self.iface = args.interface or get_default_iface()
@@ -1344,6 +1788,10 @@ class ICMPVNCClient:
         self.rate = min(max(args.rate, 1), MAX_RATE)
         self.burst_rate = min(10000 if args.mode == 'xdp' else 7000, self.rate * 3)
         self.headless = args.headless
+        self.mobile = getattr(args, 'mobile', False)
+        self.shell_active = False
+        self.shell_crypto = None
+        self._shell_input_queue = collections.deque()
         ti = ICMP_TYPES[args.type]
         self.req_type = ti[0]; self.reply_type = ti[1]
         self.type_name = ti[2]; self.has_id = ti[3]; self.magic_extra = ti[4]
@@ -1356,6 +1804,8 @@ class ICMPVNCClient:
         self._input_queue = collections.deque(maxlen=512)
         self._bg_download = None
         self._bg_upload = None
+        self._bg_shell = None
+        self._bg_ping = None
         self.kf_consecutive_fails = 0
         self.kf_force_next = True
         self.kf_backoff_until = 0; self.kf_original_rate = 0
@@ -1370,6 +1820,9 @@ class ICMPVNCClient:
         self._cmd_queue = queue.Queue()
         self._cmd_result = queue.Queue()
         self._exit_loop = False
+        self._recv_lock = threading.Lock()
+        self._shell_reply_queue = queue.Queue()
+        self._ping_reply_queue = queue.Queue()
 
     def _send_icmp(self, icmp_bytes):
         if self.mode == 'raw': return self.transport.send(icmp_bytes)
@@ -1377,7 +1830,110 @@ class ICMPVNCClient:
             frame = wrap_eth_ip(icmp_bytes, self.ip4, self.server_ip, self.mac, self.dst_mac)
             self.transport.reclaim(); return self.transport.send_one(frame)
 
-    def _recv_replies(self):
+    def _init_viewer(self, w, h):
+        if self.viewer is not None or self.headless: return
+        try:
+            if self.mobile:
+                self.viewer = MobileFrameViewer(w, h, input_callback=self._queue_input)
+                _vlog("Mobile viewer started (SDL2 fullscreen)")
+            else:
+                self.viewer = FrameViewer(w, h,
+                    cmd_callback=self._handle_command,
+                    input_callback=self._queue_input)
+        except Exception as ex:
+            _vlog(f"Viewer init failed: {ex}")
+            self.headless = True
+            self.viewer = HeadlessCLI(cmd_callback=self._handle_command,
+                                      shell_input_queue=self._shell_input_queue)
+
+    def _shell_handshake(self):
+        sc = CryptoV4(self.crypto.psk)
+        client_pub = sc.generate_dh()
+        shell_cn = os.urandom(16)
+        self._send_cmd(CMD_SHELL_OPEN, 0, client_pub + shell_cn)
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            try:
+                item = self._shell_reply_queue.get(timeout=0.1)
+                rcmd = item[1]
+                if rcmd == CMD_SHELL_OPEN:
+                    rdata = item[2]
+                    plain = self.crypto.decrypt(rdata)
+                    if plain and len(plain) >= 49 and plain[0] == 0x01:
+                        server_pub = plain[1:33]; shell_sn = plain[33:49]
+                        sc.derive(shell_cn, shell_sn, client_pub, server_pub)
+                        self.shell_crypto = sc
+                        self.shell_active = True
+                        if self.viewer and hasattr(self.viewer, 'shell_mode'):
+                            self.viewer.shell_mode = True
+                        return ("[*] Shell open (CryptoV4: BitRev+Sub+ARX×13"
+                                "+Speck×34+SHA512) — type commands, !exit to close")
+                    elif plain and len(plain) > 1 and plain[0] == 0x00:
+                        return f"[!] Shell error: {plain[1:].decode('utf-8','replace')}"
+            except queue.Empty:
+                pass
+            self._wait_fd(0.1)
+        return "[!] Shell handshake timed out"
+
+    def _start_bg_shell(self):
+        if self._bg_shell: return "[!] Shell handshake already in progress"
+        self._bg_shell = {'done': False, 'result': None}
+        bg = self._bg_shell
+        def _run():
+            bg['result'] = self._shell_handshake()
+            bg['done'] = True
+        threading.Thread(target=_run, daemon=True, name='ShellHandshake').start()
+        return None
+
+    def _do_ping_inline(self):
+        seq = self.seq; self.seq += 1
+        t0 = time.time()
+        self._send_cmd(CMD_PING, seq, struct.pack('!d', t0))
+        deadline = t0 + 3.0
+        while time.time() < deadline:
+            try:
+                item = self._ping_reply_queue.get(timeout=0.1)
+                rcmd = item[1]
+                if rcmd == CMD_PING:
+                    rdata = item[2]
+                    plain = self.crypto.decrypt(rdata)
+                    if plain and len(plain) >= 8:
+                        sent_t = struct.unpack('!d', plain[:8])[0]
+                        rtt_ms = (time.time() - sent_t) * 1000
+                        return rtt_ms
+            except queue.Empty:
+                pass
+            self._wait_fd(0.05)
+        return None
+
+    def _start_bg_ping(self):
+        if self._bg_ping: return "[!] Ping already in progress"
+        self._bg_ping = {'done': False, 'result': None}
+        bg = self._bg_ping
+        def _run():
+            bg['result'] = self._do_ping_inline()
+            bg['done'] = True
+        threading.Thread(target=_run, daemon=True, name='PingInline').start()
+        return None
+
+    def _write_shell_output(self, data):
+        if not data: return
+        if self.viewer and hasattr(self.viewer, 'write_shell_output'):
+            self.viewer.write_shell_output(data)
+        elif self.viewer and self.viewer.is_alive():
+            try:
+                text = data.decode('utf-8', errors='replace')
+                clean = re.sub(
+                    r'\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]'
+                    r'|\x1b\].*?(?:\x07|\x1b\\)'
+                    r'|\x1b.',
+                    '', text, flags=re.DOTALL)
+                clean = clean.replace('\r', '')
+                for line in clean.splitlines():
+                    if line.strip(): self._log(line)
+            except Exception: pass
+
+    def _recv_replies_raw(self):
         now = time.time(); out = []; rt = self.reply_type
         hi = self.has_id; me = self.magic_extra; srv_ip = self.server_ip
         if self.mode == 'raw':
@@ -1412,6 +1968,24 @@ class ICMPVNCClient:
                 seq = struct.unpack('!I', fr[po+2:po+6])[0]
                 cmd = fr[po+6]; dlen = struct.unpack('!H', fr[po+7:po+9])[0]
                 out.append((seq, cmd, bytes(fr[po+9:po+9+dlen]), now))
+        return out
+
+    def _recv_replies(self):
+        now = time.time(); out = []
+        for seq, cmd, data, ts in self._recv_replies_raw():
+            if cmd in (CMD_SHELL_OPEN, CMD_SHELL_INPUT, CMD_SHELL_CLOSE):
+                try:
+                    self._shell_reply_queue.put_nowait((seq, cmd, data, ts))
+                except queue.Full:
+                    pass
+                continue
+            if cmd == CMD_PING:
+                try:
+                    self._ping_reply_queue.put_nowait((seq, cmd, data, ts))
+                except queue.Full:
+                    pass
+                continue
+            out.append((seq, cmd, data, ts))
         if out and (self._bg_download or self._bg_upload):
             filtered = []
             for item in out:
@@ -1499,7 +2073,6 @@ class ICMPVNCClient:
         return self._send_icmp(build_icmp(self.req_type, self.has_id, self.pkt_size, seq, cmd, enc))
 
     def _queue_input(self, cmd_type, payload):
-        """Thread-safe: called from viewer's tk thread, drained by frame loop."""
         self._input_queue.append((cmd_type, payload))
 
     def _request_frame(self, scale=0, force_key=0):
@@ -1507,7 +2080,7 @@ class ICMPVNCClient:
         cursor_flag = 1 if self.hide_server_cursor else 0
         self._send_cmd(CMD_FRAME_REQ, seq, bytes([scale, force_key, cursor_flag, 0]))
         deadline = time.time() + 3.0
-        while time.time() < deadline:
+        while True:
             for rseq, rcmd, rdata, _ in self._recv_replies():
                 if rcmd == CMD_FRAME_REQ:
                     plain = self.crypto.decrypt(rdata)
@@ -1515,18 +2088,18 @@ class ICMPVNCClient:
                         fid, mode, w, h, nc, csz, fr, rc = struct.unpack('!IBHHHIHH', plain[:19])
                         return fid, mode, w, h, nc, csz, fr, rc
                 self._collect_kf_chunks(rseq, rcmd, rdata)
+            if time.time() >= deadline:
+                break
             self._wait_fd(0.05)
         return None
 
     def _download_frame(self, frame_id, num_chunks):
-        """Download all chunks for a frame. Burst rate for large frames."""
         effective_rate = self.burst_rate if num_chunks > 30 else self.rate
         chunks = {}; interval = 1.0 / effective_rate if effective_rate > 0 else 0
         next_send = time.time(); next_chunk = 0
         fid_bytes = struct.pack('!I', frame_id); start = time.time()
         while len(chunks) < num_chunks:
             now = time.time()
-            if now - start > 10.0: break
             if next_chunk < num_chunks and now >= next_send:
                 if next_chunk not in chunks:
                     self._send_cmd(CMD_FRAME_DATA, next_chunk, fid_bytes)
@@ -1540,6 +2113,7 @@ class ICMPVNCClient:
                         rfid = struct.unpack('!I', plain[:4])[0]
                         if rfid == frame_id: chunks[rseq] = plain[4:]; got_any = True
                 self._collect_kf_chunks(rseq, rcmd, rdata)
+            if time.time() - start > 10.0: break
             if next_chunk >= num_chunks and len(chunks) < num_chunks and not got_any:
                 self._wait_fd(0.05)
                 resent = 0
@@ -1554,7 +2128,6 @@ class ICMPVNCClient:
         return chunks
 
     def _download_keyframe_blocking(self, fid, w, h, num_chunks, comp_sz):
-        """Download keyframe fully (blocking). Used for FIRST keyframe only."""
         self._log(f"[*] First keyframe: {comp_sz:,}B / {num_chunks} chunks (blocking)")
         fid_bytes = struct.pack('!I', fid)
         effective_rate = self.burst_rate if num_chunks > 30 else self.rate
@@ -1562,7 +2135,6 @@ class ICMPVNCClient:
         next_send = time.time(); next_chunk = 0; start = time.time()
         while len(chunks) < num_chunks:
             now = time.time()
-            if now - start > 30.0: break
             if next_chunk < num_chunks and now >= next_send:
                 if next_chunk not in chunks:
                     self._send_cmd(CMD_KEY_CHUNK, next_chunk, fid_bytes)
@@ -1575,6 +2147,7 @@ class ICMPVNCClient:
                     if plain and len(plain) >= 4:
                         rfid = struct.unpack('!I', plain[:4])[0]
                         if rfid == fid: chunks[rseq] = plain[4:]; got_any = True
+            if time.time() - start > 30.0: break
             if next_chunk >= num_chunks and len(chunks) < num_chunks and not got_any:
                 self._wait_fd(0.05)
                 resent = 0
@@ -1661,24 +2234,9 @@ class ICMPVNCClient:
         except: pass
 
     def _do_ping(self):
-        """Queue a ping — frame_loop will execute it with exclusive socket access."""
         self._cmd_queue.put(('ping',))
         try: return self._cmd_result.get(timeout=10)
         except queue.Empty: return None
-
-    def _do_ping_inline(self):
-        """Execute ping inline from frame_loop — has exclusive socket access."""
-        seq = self.seq; self.seq += 1
-        self._send_cmd(CMD_TEST, seq, struct.pack('!d', time.time()))
-        deadline = time.time() + 3.0
-        while time.time() < deadline:
-            for rseq, rcmd, rdata, _ in self._recv_replies():
-                if rcmd == CMD_TEST:
-                    plain = self.crypto.decrypt(rdata)
-                    if plain and len(plain) >= 8:
-                        return (time.time() - struct.unpack('!d', plain[:8])[0]) * 1000
-            self._wait_fd(0.05)
-        return None
 
     def _download_file(self, remote_path):
         if self._bg_download: return "[!] Download already in progress"
@@ -1687,7 +2245,6 @@ class ICMPVNCClient:
         except queue.Empty: return "[!] Download start timeout"
 
     def _start_bg_download(self, remote_path):
-        """Start background download — metadata exchange is quick, chunks are async."""
         seq = self.seq; self.seq += 1
         self._send_cmd(CMD_FILE_REQ, seq, remote_path.encode('utf-8'))
         deadline = time.time() + 5.0; hdr = None
@@ -1731,7 +2288,6 @@ class ICMPVNCClient:
         except queue.Empty: return "[!] Upload start timeout"
 
     def _start_bg_upload(self, local_path):
-        """Start background upload — header ACK is quick, chunks sent async."""
         if not os.path.isfile(local_path): return f"[!] Not found: {local_path}"
         fsz = os.path.getsize(local_path)
         with open(local_path, 'rb') as f: data = f.read()
@@ -1760,7 +2316,6 @@ class ICMPVNCClient:
         return f"[*] Uploading: {fname} ({fsz:,}B, {len(data_chunks)} chunks)"
 
     def _service_bg_transfers(self):
-        """Non-blocking: send a batch of file chunks per frame loop iteration."""
         if self._bg_download:
             dl = self._bg_download; sent = 0
             while dl['next_idx'] < dl['nc'] and sent < 50:
@@ -1793,21 +2348,52 @@ class ICMPVNCClient:
         parts = cmd_str.strip().split()
         if not parts: return None
         cmd = parts[0].lower()
-        if not cmd.startswith('!'): return "[!] Commands start with ! — type !help"
+        if not cmd.startswith('!'):
+            if self.shell_active:
+                self._shell_input_queue.append(cmd_str.encode() + b'\n')
+                return None
+            return "[!] Use !shell to open a shell session"
         cmd = cmd[1:]; args = parts[1:]
         if cmd == 'help':
-            return ("Session:  !pause !resume !reconnect !disconnect !quality <1-6>\n"
-                    "Capture:  !screenshot !ss !record start/stop !record gif <sec>\n"
+            if self.shell_active:
+                return ("Shell mode — everything typed goes to the remote shell.\n"
+                        "  !exit      close shell, return to icmpvnc\n"
+                        "  !clear     clear screen and redraw remote prompt\n"
+                        "  Ctrl+C     send SIGINT to remote foreground process\n"
+                        "  !screenshot / !ss / !record / !ping / !stats — still work\n"
+                        "  All other !commands also available while in shell")
+            headless_note = " (headless)" if self.headless else ""
+            return (f"Session{headless_note}:  !pause !resume !reconnect !disconnect !quality <1-6>\n"
+                    "Capture:  !screenshot !ss !record start|stop|gif <sec>\n"
                     "Files:    !download <path> !dl  !upload <path> !ul\n"
-                    "Display:  !fit !fullscreen !fs !zoom <pct> !stats !cursor (server cursor)\n"
-                    "Input:    !vnc (toggle, Right Ctrl to release) !cad (Ctrl+Alt+Del)\n"
-                    "Diag:     !ping !info !bandwidth !keyframe")
-        elif cmd == 'pause': self.paused = True; return "[*] Paused"
-        elif cmd == 'resume': self.paused = False; return "[*] Resumed"
-        elif cmd in ('disconnect','quit','exit'):
+                    "Shell:    !shell (open)  !exit (close)  — type freely inside\n"
+                    "Input:    !cad (Ctrl+Alt+Del)\n"
+                    "Diag:     !ping !info !bandwidth !keyframe !stats\n"
+                    "Display:  !fit !fullscreen !fs !zoom <pct> !vnc !cursor")
+        elif cmd in ('disconnect', 'quit'):
             self._cmd_queue.put(('disconnect',))
             if self.viewer: self.viewer.running = False
             return "[*] Disconnecting..."
+        elif cmd == 'exit':
+            if self.shell_active:
+                self._send_cmd(CMD_SHELL_CLOSE, self.seq, b'\x01')
+                self.seq += 1
+                self.shell_active = False
+                self.shell_crypto = None
+                if self.viewer and hasattr(self.viewer, 'shell_mode'):
+                    self.viewer.shell_mode = False
+                return "[*] Shell closed — back to icmpvnc"
+            self._cmd_queue.put(('disconnect',))
+            if self.viewer: self.viewer.running = False
+            return "[*] Disconnecting..."
+        elif cmd == 'shell':
+            if self.shell_active:
+                return "[!] Already in shell — type !exit to close first"
+            self._cmd_queue.put(('shell',))
+            try: return self._cmd_result.get(timeout=10)
+            except queue.Empty: return "[!] Shell handshake timed out"
+        elif cmd == 'pause': self.paused = True; return "[*] Paused"
+        elif cmd == 'resume': self.paused = False; return "[*] Resumed"
         elif cmd == 'reconnect':
             self._cmd_queue.put(('reconnect',))
             try:
@@ -1846,7 +2432,9 @@ class ICMPVNCClient:
                     s=int(args[1])
                     if s<1 or s>60: return "[!] 1-60s"
                     if not self.recorder: self.recorder=FrameRecorder(self.frame_w or 0,self.frame_h or 0)
-                    self.recorder.start_gif(s); return f"[*] Recording {s}s GIF..."
+                    self.recorder._log_fn=self._log
+                    self.recorder.start_gif(s)
+                    return f"[*] Recording {s}s GIF ({GIF_FPS}fps max, ≤{GIF_MAX_W}px wide)..."
                 except: return "[!] Invalid"
             return "[!] start|stop|gif"
         elif cmd in ('download','dl'):
@@ -1880,7 +2468,9 @@ class ICMPVNCClient:
             return f"[*] FPS:{self.fps_val:.1f} | Frames:{self.frames_total} | {self.bytes_total/1e6:.1f}MB | {bw:.2f}MB/s | {el:.0f}s"
         elif cmd == 'ping':
             rtt=self._do_ping()
-            return f"[*] {rtt:.2f}ms" if rtt else "[!] Timeout"
+            if isinstance(rtt, (int, float)):
+                return f"[*] {rtt:.2f}ms"
+            return rtt if rtt else "[!] Timeout"
         elif cmd == 'info':
             el=time.time()-self.start_time if self.start_time else 0
             return (f"[*] Server:{self.server_ip} | {'XDP' if self.mode=='xdp' else 'Raw'}\n"
@@ -1911,21 +2501,18 @@ class ICMPVNCClient:
                 return "[*] Server cursor hidden (saves FPS, white arrow backup in VNC)"
             else:
                 return "[*] Server cursor visible"
+        elif cmd == 'clear':
+            if self.shell_active:
+                self._write_shell_output(b'\x1b[2J\x1b[H')
+                self._shell_input_queue.append(b'\x0c')
+                return None
+            return None
         elif cmd == 'cad':
             for ks in (0xffe3, 0xffe9, 0xffff):
                 self._queue_input(CMD_INPUT_KEY, struct.pack('!BI', 1, ks))
             for ks in (0xffff, 0xffe9, 0xffe3):
                 self._queue_input(CMD_INPUT_KEY, struct.pack('!BI', 0, ks))
             return "[*] Sent Ctrl+Alt+Del"
-        elif cmd == 'sendkey':
-            if not args: return "[!] !sendkey <keysym_name>"
-            import tkinter as _tk
-            try:
-                tmp = _tk.Tk(); tmp.withdraw()
-                ks = tmp.winfo_id()
-                tmp.destroy()
-            except: pass
-            return "[*] Use !cad for Ctrl+Alt+Del"
         return f"[!] Unknown: !{cmd}"
 
     def _frame_loop(self):
@@ -1945,7 +2532,8 @@ class ICMPVNCClient:
                 while not self._cmd_queue.empty():
                     cmd_item = self._cmd_queue.get_nowait()
                     if cmd_item[0] == 'ping':
-                        self._cmd_result.put(self._do_ping_inline())
+                        r = self._start_bg_ping()
+                        if r: self._cmd_result.put(r)
                     elif cmd_item[0] == 'download':
                         self._cmd_result.put(self._start_bg_download(cmd_item[1]))
                     elif cmd_item[0] == 'upload':
@@ -1963,7 +2551,18 @@ class ICMPVNCClient:
                             self._cmd_result.put("[*] Reconnected (fresh X25519+PSK)")
                         else:
                             self._cmd_result.put("[!] Reconnect failed")
+                    elif cmd_item[0] == 'shell':
+                        r = self._start_bg_shell()
+                        if r: self._cmd_result.put(r)
             except queue.Empty: pass
+
+            if self._bg_ping and self._bg_ping['done']:
+                self._cmd_result.put(self._bg_ping['result'])
+                self._bg_ping = None
+
+            if self._bg_shell and self._bg_shell['done']:
+                self._cmd_result.put(self._bg_shell['result'])
+                self._bg_shell = None
 
             while self._input_queue:
                 try:
@@ -1973,6 +2572,39 @@ class ICMPVNCClient:
                     break
 
             self._service_bg_transfers()
+
+            if self.shell_active:
+                sc = self.shell_crypto
+                if sc is None:
+                    self.shell_active = False
+                else:
+                    pending = b''
+                    try:
+                        while self._shell_input_queue:
+                            pending += self._shell_input_queue.popleft()
+                    except IndexError: pass
+                    enc = sc.encrypt(pending if pending else b'\x00')
+                    self._send_cmd(CMD_SHELL_INPUT, self.seq, enc)
+                    self.seq += 1
+
+                    self._recv_replies()  # populate _shell_reply_queue from transport (shell replies diverted; frame replies ignored in shell mode)
+
+                    # Option Y: drain from dedicated queue instead of _recv_replies()
+                    while True:
+                        try:
+                            item = self._shell_reply_queue.get_nowait()
+                            _, rcmd, rdata, _ = item
+                            if rcmd == CMD_SHELL_INPUT:
+                                outer = self.crypto.decrypt(rdata)
+                                if outer:
+                                    inner = sc.decrypt(outer)
+                                    if inner and inner != b'\x00':
+                                        self._write_shell_output(inner)
+                        except queue.Empty:
+                            break
+
+                    self._wait_fd(0.01)
+                    continue
 
             if time.time() < self.kf_backoff_until: time.sleep(0.1); continue
 
@@ -2003,10 +2635,6 @@ class ICMPVNCClient:
                 if self.recorder and self.recorder.recording:
                     self.recorder.width = w; self.recorder.height = h
 
-            if self.viewer is None and not self.headless:
-                try: self.viewer = FrameViewer(w, h, cmd_callback=self._handle_command,
-                                               input_callback=self._queue_input)
-                except: self.headless = True
 
             if mode == 1:
                 if not self.kf_first_done:
@@ -2016,6 +2644,7 @@ class ICMPVNCClient:
                         self.kf_consecutive_fails = 0
                         self.last_frame_type = 'K'
                         if self.rate < self.kf_original_rate: self.rate = self.kf_original_rate
+                        self._init_viewer(w, h)
                         if self.viewer and self.viewer.is_alive():
                             self.viewer.update(bytes(self.frame_rgb))
                             self.viewer.width = w; self.viewer.height = h
@@ -2083,6 +2712,8 @@ class ICMPVNCClient:
             self.kf_consecutive_fails = 0
             if self.rate < self.kf_original_rate: self.rate = self.kf_original_rate
 
+            self._init_viewer(w, h)
+
             if self.viewer and self.viewer.is_alive():
                 self.viewer.update(bytes(self.frame_rgb))
                 self.viewer.width = w; self.viewer.height = h
@@ -2136,6 +2767,9 @@ class ICMPVNCClient:
             ("Crypto",     "BitRev→Sub→ARX→Speck→SHA256"),
             ("Key Ex",     "X25519 ECDH + PSK"),
         ]
+        if self.mobile:
+            rows.insert(2, ("Display", "Mobile SDL2 fullscreen (no X11)"))
+            rows.insert(3, ("Input",   "tap=click  hold=right  2×tap=keyboard"))
         if self.headless: rows.append(("Display", "Headless"))
         _tunnel_box("Client", rows)
         print()
@@ -2159,9 +2793,29 @@ class ICMPVNCClient:
             _event("⏻", "Interrupted.", _C.MAG); return
         _event("✓", "Connected — X25519+PSK session keys derived", _C.GREEN); print()
         self.start_time = time.time()
+
+        if not self.mobile and not self.headless:
+            has_display = (bool(os.environ.get('DISPLAY')) or
+                           bool(os.environ.get('WAYLAND_DISPLAY')))
+            if not has_display:
+                looks_android = (os.path.exists('/system/bin/screencap') or
+                                 os.path.exists('/dev/dri/card0'))
+                if looks_android:
+                    _event("!", "No display server detected ($DISPLAY unset).", _C.GOLD)
+                    _event("!", "On Android/NetHunter use --mobile for SDL2 display.", _C.GOLD)
+                else:
+                    _event("!", "No display server ($DISPLAY) — switching to headless.", _C.GOLD)
+                self.headless = True
+
+        if self.headless and self.viewer is None:
+            self.viewer = HeadlessCLI(cmd_callback=self._handle_command,
+                                      shell_input_queue=self._shell_input_queue)
+
         try: self._frame_loop()
         except KeyboardInterrupt: pass
-        except Exception as e: _event("✗", f"Error: {e}", _C.BRED); import traceback; traceback.print_exc()
+        except Exception as e:
+            _event("✗", f"Error: {e}", _C.BRED)
+            import traceback; traceback.print_exc()
         try: self._send_disconnect()
         except: pass
         if self.viewer: self.viewer.close()
@@ -2187,6 +2841,10 @@ def main():
     p.add_argument('-m','--mac'); p.add_argument('-s','--size',type=int,default=1000)
     p.add_argument('-r','--rate',type=int,default=5000)
     p.add_argument('-k','--key',default=None); p.add_argument('--headless',action='store_true')
+    p.add_argument('--mobile', action='store_true',
+                   help='Mobile mode: SDL2 fullscreen renderer + touch input. '
+                        'Requires libSDL2 (Termux: pkg install libsdl2). '
+                        'No X server or KeX required.')
     p.add_argument('-v','--verbose',action='store_true',help='Show detailed init')
     p.add_argument('-q','--quiet',action='store_true',help='Errors only')
     p.add_argument('--no-color',action='store_true',help='Disable ANSI colors')
