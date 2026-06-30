@@ -1,13 +1,14 @@
 # ICMPVNC ⛏
 
 ## Description/Overview
-This is a 100% ICMP based VNC, featuring screen sharing, full keyboard & mouse input, bidirectional file transfer, varying display server compatibility using a multi capture engine designed for X11, Wayland, headless/ARM/VMs, along with a cross compatible raw or XDP (kernel bypass) tranport system crafted for usable FPS over many ICMP types.
+This is a 100% ICMP based VNC for desktop or mobile devices, featuring screen sharing, full keyboard & mouse input, bidirectional file transfer, shell input, varying display server compatibility using a multi capture engine designed for X11, Wayland, headless/ARM/VMs, along with a cross compatible raw or XDP (kernel bypass) tranport system crafted for usable FPS over many ICMP types.
 
 ## Features
 - A broad toolkit of many ICMP types (e.g., Echo, Timestamp, Traceroute)
 - X25519 ECDH + PSK
 - Light encryption for deltas using SHA256-CTR "Counter mode"(CSPRNG stream cipher) + HMAC-SHA256
 - Full encryption for keyframes using BitReversal + substitution + PrimeARX(2) + Speck128/256(2) + SHA256-CTR + HMAC-SHA256
+- Enhanced encryption for shell traffic using BitReversal + substitution + PrimeARX(13) + Speck128/256(34) + SHA256-CTR + HMAC-SHA512
 - Capture fallback: xcb_shm_attach_fd (X11) --> XShmAttachFd --> SysV IPC + XShmAttach --> XGetImage --> PipeWire + GStreamer (Wayland) --> DRM/KMS (ARM/VM)
 - Input fallback: uinput --> XTest
 - DRM/KMS Direct GPU Framebuffer access, linear for ARM/VM, X-Y tiling for Intel/AMD64 (non Nvidia GPUs)
@@ -18,6 +19,7 @@ This is a 100% ICMP based VNC, featuring screen sharing, full keyboard & mouse i
 - Background file transfers, uninterrupted streaming/input
 - PNG encoder capable of screenshots or recording frames (24bit RGB PNG assembler using zlib compressed IDAT chunks) 
 - GIF animator (216 color quantization --> LZW --> GIF89a)
+- Nethunter/Android support
 
 ### Native Helper
 - At startup, writes a small C file with bgra_to_rgb() (BGRA-->RGB with downscale in one pass) and xor_bytes() (buffer XOR for delta computation)
@@ -55,6 +57,7 @@ User takes on full responsibility to use in a legal manner
 - -v, --verbose — Detailed initialization and debug logs
 - -q, --quiet — Error only output (suppress banner and status)
 - --no-color — Disable ANSI colors in console output
+- --mobile — For Nethunter/Android 
 - -h, --help — Run 'python3 server.py --help' for help
 
 ### Client quick start
@@ -75,6 +78,7 @@ User takes on full responsibility to use in a legal manner
 - -v, --verbose — Enable detailed logs
 - -q, --quiet — Errors only output
 - --no-color — Disable ANSI colors
+- --mobile — For Nethunter/Android (note use --headless as well unless running in kex or Termux w/libsdl2) 
 - -h, --help — Run 'python3 client.py --help' for help
 
 ### Client ICMP type Flags 
@@ -113,6 +117,7 @@ The server auto detects all types. The client selects one.
 - `!info` — server IP, transport, ICMP type, rate, packet size, crypto, resolution, uptime
 - `!bandwidth` — budget (rate×size), actual throughput, total transferred
 - `!keyframe` — force full frame download, clears delta state
+- `!shell` — Shell w/key rotation 
 
 
 **!cursor command toggle disables server side cursor compositing, slightly boosting FPS. Reduces dirty rows per frame (cursor movement no longer dirties the delta). When hidden + VNC mode active, a white arrow overlay is drawn client side**
