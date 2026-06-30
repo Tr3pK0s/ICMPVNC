@@ -8,7 +8,7 @@ Usage: -i interface --mode -k password
 """
 import socket, struct, os, sys, time, mmap, ctypes, ctypes.util, re
 import select, fcntl, argparse, signal, atexit, zlib, hashlib, hmac
-import subprocess, tempfile, getpass, array, threading
+import subprocess, tempfile, getpass, array, threading, queue
 
 
 import itertools as _itertools
@@ -129,7 +129,7 @@ def _status_server(rx, tx, el, client, frame_id, chunks, pps_rx, pps_tx):
         f"{_C.DIMW}RX{_C.RST} {_C.WHITE}{rx:,}{_C.RST} "
         f"{_C.DIMW}│ TX{_C.RST} {_C.WHITE}{tx:,}{_C.RST} "
         f"{_C.DIMW}│{_C.RST} {_C.WHITE}{pps_rx:.0f}{_C.DIMW}/{_C.RST}{_C.WHITE}{pps_tx:.0f}{_C.RST}{_C.DIMW} pps{_C.RST} "
-        f"{_C.DIMW}│{_C.RST} {_C.GOLD}{c}{_C.RST} "
+        f"{_C.DIMW}│{_C.RST} {_C.WHITE}{c}{_C.RST} "
         f"{_C.DIMW}│ F:{_C.RST}{_C.WHITE}{frame_id}{_C.RST} "
         f"{_C.DIMW}C:{_C.RST}{_C.WHITE}{chunks}{_C.RST} "
         f"{_C.DIMW}│{_C.RST} {_C.GOLD}{spark}{_C.RST} "
@@ -152,7 +152,6 @@ def _vlog(msg):
         print(f"  {_C.DIMW}[v] {msg}{_C.RST}")
 
 
-
 MAGIC        = b'\xCA\xFE'
 SESSION_ID   = 0x1111
 HANDSHAKE_ID = 0xBEEF
@@ -168,6 +167,10 @@ CMD_FILE_UP_HDR  = 0x32
 CMD_FILE_UP_DATA = 0x33
 CMD_INPUT_KEY    = 0x40
 CMD_INPUT_MOUSE  = 0x41
+CMD_SHELL_OPEN   = 0x50
+CMD_SHELL_INPUT  = 0x52
+CMD_SHELL_CLOSE  = 0x54
+CMD_PING       = 0x60
 MAX_PAYLOAD  = 1400
 ENCRYPT_OH   = 28          
 
@@ -242,7 +245,6 @@ def get_iface_info(iface):
     s.close(); return ip4, mac, ip6
 
 def validate_interface(iface):
-    """Check interface exists. If not, list available and exit cleanly."""
     sysnet = '/sys/class/net'
     if not os.path.isdir(os.path.join(sysnet, iface)):
         avail = sorted(d for d in os.listdir(sysnet) if d != 'lo') if os.path.isdir(sysnet) else []
@@ -263,12 +265,10 @@ def validate_interface(iface):
         pass
 
 def is_wireless(iface):
-    """Check if interface is wireless."""
     return (os.path.isdir(f'/sys/class/net/{iface}/wireless') or
             os.path.isdir(f'/sys/class/net/{iface}/phy80211'))
 
 def warn_wireless_xdp(iface):
-    """Warn user about XDP on wireless and prompt for confirmation."""
     print()
     _event("⚠", f"'{iface}' appears to be a wireless adapter.", _C.YELLOW)
     print(f"  {_C.DIMW}Most wireless drivers do NOT support native XDP.")
@@ -337,6 +337,9 @@ class Speck128_256:
             k.append((((k[i]<<3)|(k[i]>>61))&M)^li)
         self.rk = k
 
+class Speck128_256_Full(Speck128_256):
+    ROUNDS = 34
+
 class PrimeARX:
     PRIMES = [2,3,5,7,11,13,17,19,23,29,31,37,41,43,47,53]
     ROUNDS = 2
@@ -352,6 +355,9 @@ class PrimeARX:
         for i in range(self.ROUNDS):
             r1=self.PRIMES[i]&63; r2=self.PRIMES[(i+8)%16]&63
             self._rounds.append((r1,64-r1,r2,64-r2,rk[i]))
+
+class PrimeARX13(PrimeARX):
+    ROUNDS = 13
 
 def speck_ctr(speck, nonce, data):
     if not data: return b''
@@ -464,6 +470,67 @@ class CryptoV3:
         avail = max_payload - proto_overhead
         return max(0, avail - CryptoV3.RAW_OH)
 
+
+class CryptoV4:
+    NONCE_SZ = 12; MAC_SZ = 64; RAW_OH = 76
+
+    def __init__(self, psk):
+        self.psk = psk.encode('utf-8') if isinstance(psk, str) else psk
+        self.arx = None; self.speck = None
+        self.sha_key = None; self.mac_key = None
+        self.sub_fwd = None; self.sub_inv = None
+        self.tx_ctr = 0; self._rx_ctr = -1
+        self.dh_private = None; self.dh_public = None
+
+    def generate_dh(self):
+        self.dh_private, self.dh_public = x25519_keypair()
+        return self.dh_public
+
+    def derive(self, cn, sn, client_pub=None, server_pub=None):
+        if client_pub and server_pub and self.dh_private:
+            other = server_pub if client_pub == self.dh_public else client_pub
+            shared = x25519(self.dh_private, other)
+            self.dh_private = None
+            ikm = self.psk + shared
+        else:
+            ikm = self.psk
+        salt = cn + sn
+        prk = hmac.new(salt, ikm, hashlib.sha512).digest()
+        t = b''; okm = b''
+        for i in range(1, 6):
+            t = hmac.new(prk, t + b'icmpvnc-shell-v4' + bytes([i]), hashlib.sha512).digest()
+            okm += t
+        self.arx   = PrimeARX13(okm[0:32])
+        self.speck = Speck128_256_Full(okm[32:64])
+        self.sha_key = okm[64:96]
+        self.mac_key = okm[96:160]
+        self.sub_fwd, self.sub_inv = obf_sub_init(int.from_bytes(okm[160:168], 'big'))
+        self.tx_ctr = 0; self._rx_ctr = -1
+
+    def encrypt(self, data):
+        nonce = struct.pack('!I', 0) + struct.pack('!Q', self.tx_ctr); self.tx_ctr += 1
+        ct = obf_bitrev(data)
+        ct = obf_sub_enc(ct, self.sub_fwd)
+        ct = arx_ctr(self.arx, nonce, ct)
+        ct = speck_ctr(self.speck, nonce, ct)
+        ct = sha256_ctr(self.sha_key, nonce, ct)
+        tag = hmac.new(self.mac_key, nonce + ct, hashlib.sha512).digest()
+        return nonce + tag + ct
+
+    def decrypt(self, data):
+        if len(data) < self.RAW_OH: return None
+        nonce = data[:12]; tag = data[12:76]; ct = data[76:]
+        exp = hmac.new(self.mac_key, nonce + ct, hashlib.sha512).digest()
+        if not hmac.compare_digest(tag, exp): return None
+        ctr = struct.unpack('!Q', nonce[4:])[0]
+        if ctr <= self._rx_ctr: return None
+        self._rx_ctr = ctr
+        ct = sha256_ctr(self.sha_key, nonce, ct)
+        ct = speck_ctr(self.speck, nonce, ct)
+        ct = arx_ctr(self.arx, nonce, ct)
+        ct = obf_sub_dec(ct, self.sub_inv)
+        return obf_bitrev(ct)
+
 _C_SRC = r"""
 #include <stddef.h>
 void bgra_to_rgb(const unsigned char *s, unsigned char *d,
@@ -508,7 +575,6 @@ def _compile_native():
         _vlog(f"Native compile failed ({e}), using pure Python fallback")
 
 def _xor_bytes(a, b):
-    """XOR two byte strings, returns bytes."""
     if _native and len(a) == len(b):
         n = len(a)
         ba = (ctypes.c_char * n).from_buffer_copy(a)
@@ -570,7 +636,6 @@ IPC_PRIVATE = 0; IPC_CREAT = 0o1000; IPC_RMID = 0
 ZPixmap = 2; AllPlanes = (1 << 64) - 1
 
 class ScreenCapture:
-    """X11 screen capture using SHM (fast) or XGetImage (fallback)."""
     def __init__(self, scale=1):
         self.scale = max(1, min(6, scale))
         self.autoscale_floor = self.scale
@@ -601,7 +666,6 @@ class ScreenCapture:
         if dropped:
             os.seteuid(0)
             _vlog("Restored root (UID 0) for network operations")
-        register_cleanup(self.close)
         self.cursor_visible = True
         self.xfixes = None
         try:
@@ -622,7 +686,7 @@ class ScreenCapture:
         x = self.x11
         x.XOpenDisplay.argtypes = [ctypes.c_char_p]; x.XOpenDisplay.restype = ctypes.c_void_p
         x.XDefaultScreen.argtypes = [ctypes.c_void_p]; x.XDefaultScreen.restype = ctypes.c_int
-        x.XDefaultRootWindow.argtypes = [ctypes.c_void_p]; x.XDefaultRootWindow.restype = ctypes.c_ulong
+        x.XDefaultRootWindow.argtypes = [ctypes.c_ulong]; x.XDefaultRootWindow.restype = ctypes.c_ulong
         x.XGetWindowAttributes.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(XWindowAttributes)]
         x.XGetWindowAttributes.restype = ctypes.c_int
         x.XGetImage.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
@@ -722,7 +786,6 @@ class ScreenCapture:
         self.shm_info = None; self.ximage_ptr = None
 
     def _try_shm_xcb_fd(self, libc_shm, sz):
-        """Try xcb_shm_attach_fd — uses libxcb-shm which has fd-passing even when libXext doesn't."""
         try:
             xcb = ctypes.CDLL('libxcb.so.1')
             xcb_shm = ctypes.CDLL('libxcb-shm.so.0')
@@ -794,7 +857,6 @@ class ScreenCapture:
         return True
 
     def _try_shm_memfd(self, libc_shm, sz):
-        """Try XShmAttachFd with memfd_create — no UID restrictions."""
         try:
             self.xext.XShmAttachFd.argtypes = [
                 ctypes.c_void_p, ctypes.POINTER(XShmSegmentInfo),
@@ -841,7 +903,6 @@ class ScreenCapture:
         return True
 
     def _try_shm_sysv(self, libc_shm, sz):
-        """Try XShmAttach with SysV shared memory (fallback)."""
         self.shmid = libc_shm.shmget(IPC_PRIVATE, sz, IPC_CREAT | 0o777)
         if self.shmid < 0:
             _vlog("shmget failed"); return False
@@ -979,7 +1040,6 @@ class ScreenCapture:
         return compressed, mode, out_w, out_h, fid, first_row, row_count
 
     def _grab_pixels(self):
-        """Returns (raw_bgra_bytes, bytes_per_line)."""
         if self.use_shm:
             self.xext.XShmGetImage(self.display, self.root, self.ximage_ptr,
                                    0, 0, AllPlanes)
@@ -1084,7 +1144,6 @@ _KEYSYM_TO_LINUX = {
 }
 
 class UInputBackend:
-    """Input injection via /dev/uinput — works on X11, Wayland, TTY."""
     EV_SYN=0; EV_KEY=1; EV_REL=2; EV_ABS=3; SYN_REPORT=0
     ABS_X=0; ABS_Y=1; REL_WHEEL=8
     BTN_LEFT=0x110; BTN_RIGHT=0x111; BTN_MIDDLE=0x112
@@ -1163,7 +1222,6 @@ class UInputBackend:
 
 
 class XTestInputBackend:
-    """Input injection via XTest — X11 only fallback."""
     def __init__(self, x11_lib, display):
         self.x11 = x11_lib; self.display = display
         try:
@@ -1201,7 +1259,6 @@ class XTestInputBackend:
 
 
 class PipeWireCapture:
-    """Screen capture via GStreamer + PipeWire ScreenCast portal."""
     def __init__(self, scale=1):
         self.scr_w = 0; self.scr_h = 0; self.scale = scale
         self.autoscale_floor = scale; self.prev_rgb = None
@@ -1249,13 +1306,12 @@ class PipeWireCapture:
         except Exception: pass
 
     def _portal_screencast(self):
-        """Request screen cast via XDG Desktop Portal."""
         import dbus
         from dbus.mainloop.glib import DBusGMainLoop
         DBusGMainLoop(set_as_default=True)
         bus = dbus.SessionBus()
         portal = bus.get_object('org.freedesktop.portal.Desktop',
-                                '/org/freedesktop/portal/desktop')
+                                '/org.freedesktop.portal/desktop')
         sc = dbus.Interface(portal, 'org.freedesktop.portal.ScreenCast')
         token = f'icmpvnc_{os.getpid()}'
         response = [None]
@@ -1309,7 +1365,6 @@ class PipeWireCapture:
         return self._Gst.FlowReturn.OK
 
     def _grab_pixels(self):
-        """Returns (rgb_bytes, w, h) or raises."""
         with self._lock:
             if self._frame:
                 w, h, rgb = self._frame
@@ -1349,7 +1404,193 @@ class PipeWireCapture:
             except: pass
 
 
+class ScreencapCapture:
+
+    PF_RGBA_8888 = 1
+    PF_RGBX_8888 = 2
+    PF_RGB_888   = 3
+    PF_RGB_565   = 4
+    PF_BGRA_8888 = 5
+
+    def __init__(self, scale=1):
+        self.scale = scale
+        self.autoscale_floor = scale
+        self.prev_rgb = None
+        self.frame_id = 0
+        self.delta_ratios = []
+        self.last_scale_time = 0
+        self._autoscale_pending = False
+        self._zero_row = b''
+        self._zero_row_w = 0
+
+        self._bin = None
+        for path in ('/system/bin/screencap', '/system/xbin/screencap',
+                     '/vendor/bin/screencap'):
+            if os.path.exists(path):
+                self._bin = path; break
+        if not self._bin:
+            raise RuntimeError(
+                "screencap binary not found in "
+                "/system/bin, /system/xbin, /vendor/bin")
+
+        self._cmds = [
+            [self._bin],
+            ['nsenter', '--mount=/proc/1/ns/mnt', '--', self._bin],
+            ['nsenter', '-t', '1', '-m', '--', self._bin],
+            ['su', '-c', self._bin],
+            ['/sbin/su', '-c', self._bin],
+        ]
+        self._active_cmd = None
+
+        self._numpy = False
+        try:
+            import numpy as _np
+            self._np = _np; self._numpy = True
+            _vlog("ScreencapCapture: numpy available (fast pixel conversion)")
+        except ImportError:
+            _vlog("ScreencapCapture: numpy not found (pure Python, slower)")
+            _vlog("  Speed up: pkg install python-numpy  or  pip install numpy")
+
+        w, h, fmt, _ = self._raw_capture()
+        self.scr_w = w; self.scr_h = h
+        _vlog(f"ScreencapCapture: {w}x{h} fmt={fmt} cmd={' '.join(self._active_cmd)}")
+
+    def _raw_capture(self):
+        cmds = [self._active_cmd] if self._active_cmd else self._cmds
+        last_err = "no commands tried"
+        for cmd in cmds:
+            try:
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10
+                )
+                data = result.stdout
+                if len(data) < 12:
+                    last_err = (f"cmd {cmd[0]} returned {len(data)} bytes "
+                                f"(rc={result.returncode})")
+                    continue
+                if data[:4] == b'\x89PNG':
+                    last_err = "screencap returned PNG (need raw mode)"
+                    continue
+                w   = struct.unpack_from('<I', data, 0)[0]
+                h   = struct.unpack_from('<I', data, 4)[0]
+                fmt = struct.unpack_from('<I', data, 8)[0]
+                if not (0 < w <= 8192 and 0 < h <= 8192):
+                    last_err = f"invalid dimensions {w}x{h} from {cmd[0]}"
+                    continue
+                if self._active_cmd is not cmd:
+                    _vlog(f"ScreencapCapture: working cmd: {' '.join(cmd)}")
+                    self._active_cmd = cmd
+                return w, h, fmt, data[12:]
+            except FileNotFoundError:
+                last_err = f"not found: {cmd[0]}"; continue
+            except PermissionError as e:
+                last_err = f"permission: {e}"; continue
+            except subprocess.TimeoutExpired:
+                last_err = f"timeout: {' '.join(cmd[:2])}"; continue
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"; continue
+
+        raise RuntimeError(
+            f"All screencap execution methods failed.\n"
+            f"  Last error: {last_err}\n"
+            f"  Tried {len(cmds)} method(s). Ensure root and screencap at "
+            f"{self._bin}.\n"
+            f"  NetHunter chroot fix: ensure nsenter is installed: "
+            f"apt install util-linux")
+
+    def _pixels_to_rgb(self, w, h, fmt, pixels):
+        n = w * h
+        if self._numpy:
+            np = self._np
+            try:
+                arr = np.frombuffer(pixels, dtype=np.uint8)
+                if fmt in (self.PF_RGBA_8888, self.PF_RGBX_8888):
+                    return arr[:n*4].reshape(n, 4)[:, :3].tobytes()
+                elif fmt == self.PF_BGRA_8888:
+                    t = arr[:n*4].reshape(n, 4)
+                    return np.stack([t[:,2], t[:,1], t[:,0]], axis=1).tobytes()
+                elif fmt == self.PF_RGB_888:
+                    return bytes(arr[:n*3])
+                elif fmt == self.PF_RGB_565:
+                    t = arr[:n*2].view(np.uint16)
+                    r = ((t >> 11) & 0x1F).astype(np.uint32) * 255 // 31
+                    g = ((t >> 5)  & 0x3F).astype(np.uint32) * 255 // 63
+                    b = (t         & 0x1F).astype(np.uint32) * 255 // 31
+                    return np.stack([r.astype(np.uint8), g.astype(np.uint8),
+                                     b.astype(np.uint8)], axis=1).tobytes()
+                else:
+                    bpp = max(1, len(pixels) // n) if n > 0 else 4
+                    return arr[:n*bpp].reshape(n, bpp)[:, :3].tobytes()
+            except Exception as e:
+                _vlog(f"ScreencapCapture numpy error: {e}, using pure Python")
+        pix = bytearray(pixels)
+        rgb = bytearray(n * 3)
+        if fmt in (self.PF_RGBA_8888, self.PF_RGBX_8888):
+            for i in range(n):
+                s=i*4; d=i*3
+                rgb[d]=pix[s]; rgb[d+1]=pix[s+1]; rgb[d+2]=pix[s+2]
+        elif fmt == self.PF_BGRA_8888:
+            for i in range(n):
+                s=i*4; d=i*3
+                rgb[d]=pix[s+2]; rgb[d+1]=pix[s+1]; rgb[d+2]=pix[s]
+        elif fmt == self.PF_RGB_888:
+            rgb = bytearray(pix[:n*3])
+        elif fmt == self.PF_RGB_565:
+            for i in range(n):
+                s=i*2; px=pix[s]|(pix[s+1]<<8); d=i*3
+                rgb[d]  =(px>>11&0x1F)*255//31
+                rgb[d+1]=(px>>5 &0x3F)*255//63
+                rgb[d+2]=(px    &0x1F)*255//31
+        else:
+            bpp = max(1, len(pix)//n) if n > 0 else 4
+            for i in range(n):
+                s=i*bpp; d=i*3
+                rgb[d]  =pix[s]   if s   <len(pix) else 0
+                rgb[d+1]=pix[s+1] if s+1 <len(pix) else 0
+                rgb[d+2]=pix[s+2] if s+2 <len(pix) else 0
+        return bytes(rgb)
+
+    def _grab_pixels(self):
+        w, h, fmt, pixels = self._raw_capture()
+        if w != self.scr_w or h != self.scr_h:
+            self.scr_w = w; self.scr_h = h
+            self.prev_rgb = None
+        return self._pixels_to_rgb(w, h, fmt, pixels)
+
+    def grab(self, force_keyframe=False):
+        rgb_full = self._grab_pixels()
+        sc = self.scale
+        out_w = self.scr_w // sc; out_h = self.scr_h // sc
+        if sc > 1:
+            out = bytearray(out_w * out_h * 3); di = 0
+            for y in range(0, out_h * sc, sc):
+                ro = y * self.scr_w * 3
+                for x in range(0, out_w * sc, sc):
+                    si = ro + x * 3
+                    out[di]=rgb_full[si]; out[di+1]=rgb_full[si+1]
+                    out[di+2]=rgb_full[si+2]; di += 3
+            rgb = bytes(out)
+        else:
+            rgb = rgb_full
+        first_row = 0; row_count = out_h
+        if force_keyframe or self.prev_rgb is None or len(rgb) != len(self.prev_rgb):
+            compressed = zlib.compress(rgb, 6); mode = 1
+        else:
+            delta = _xor_bytes(rgb, self.prev_rgb)
+            compressed = zlib.compress(delta, 1); mode = 0
+        self.prev_rgb = bytearray(rgb) if not force_keyframe else None
+        if mode != 1: self.prev_rgb = bytearray(rgb)
+        fid = self.frame_id; self.frame_id += 1
+        return compressed, mode, out_w, out_h, fid, first_row, row_count
+
+    def close(self): pass
+
+
 class DRMCapture:
+
     def __init__(self, scale=1):
         self.scr_w = 0; self.scr_h = 0; self.scale = scale
         self.autoscale_floor = scale; self.prev_rgb = None
@@ -1361,60 +1602,260 @@ class DRMCapture:
         self._mode = None
         self._mmap_ptr = None; self._mmap_sz = 0
         self._gbm = None; self._gbm_dev = None; self._gbm_bo = None
+        self._fb0_fd = -1
+        self._fb0_stride = 0; self._fb0_bpp = 0
         self._open_drm()
+
 
     def _iowr(self, nr, sz):
         return 0xC0000000 | (sz << 16) | (0x64 << 8) | nr
+
+
+    def _find_fb_via_legacy_crtc(self):
+        res = bytearray(64)
+        struct.pack_into('QQQQ IIII', res, 0, 0,0,0,0, 0,0,0,0)
+        try:
+            fcntl.ioctl(self._drm_fd, self._iowr(0xA0, 64), res)
+        except Exception as e:
+            raise RuntimeError(f"DRM_IOCTL_MODE_GETRESOURCES: {e}")
+        n_fb, n_crtc, n_conn, n_enc = struct.unpack_from('IIII', res, 32)
+        if n_crtc == 0:
+            return 0, 0
+        fbs   = (ctypes.c_uint32 * max(n_fb,1))()
+        crtcs = (ctypes.c_uint32 * max(n_crtc,1))()
+        conns = (ctypes.c_uint32 * max(n_conn,1))()
+        encs  = (ctypes.c_uint32 * max(n_enc,1))()
+        struct.pack_into('QQQQ IIII', res, 0,
+            ctypes.addressof(fbs),  ctypes.addressof(crtcs),
+            ctypes.addressof(conns),ctypes.addressof(encs),
+            n_fb, n_crtc, n_conn, n_enc)
+        fcntl.ioctl(self._drm_fd, self._iowr(0xA0, 64), res)
+        cd = bytearray(104)
+        for ci in range(n_crtc):
+            struct.pack_into('I', cd, 12, crtcs[ci])
+            try:
+                fcntl.ioctl(self._drm_fd, self._iowr(0xA1, 104), cd)
+                fb_id = struct.unpack_from('I', cd, 16)[0]
+                if fb_id > 0:
+                    _vlog(f"DRM: legacy CRTC[{ci}] fb_id={fb_id}")
+                    return fb_id, n_crtc
+            except:
+                continue
+        return 0, n_crtc
+
+
+    def _find_fb_via_planes(self):
+        pr = bytearray(16)
+        struct.pack_into('QI', pr, 0, 0, 0)
+        try:
+            fcntl.ioctl(self._drm_fd, self._iowr(0xB5, 16), pr)
+        except Exception as e:
+            _vlog(f"DRM: GETPLANERESOURCES failed: {e}"); return 0
+        n_planes = struct.unpack_from('I', pr, 8)[0]
+        if n_planes == 0:
+            _vlog("DRM: 0 planes reported"); return 0
+        _vlog(f"DRM: {n_planes} planes found")
+        plane_ids = (ctypes.c_uint32 * n_planes)()
+        struct.pack_into('QI', pr, 0, ctypes.addressof(plane_ids), n_planes)
+        try:
+            fcntl.ioctl(self._drm_fd, self._iowr(0xB5, 16), pr)
+        except Exception as e:
+            _vlog(f"DRM: GETPLANERESOURCES (2nd pass) failed: {e}"); return 0
+        pd = bytearray(32)
+        best_fb = 0
+        for pi in range(n_planes):
+            pid = plane_ids[pi]
+            pd[:] = b'\x00' * 32
+            struct.pack_into('I', pd, 0, pid)
+            try:
+                fcntl.ioctl(self._drm_fd, self._iowr(0xB6, 32), pd)
+            except:
+                continue
+            crtc_id = struct.unpack_from('I', pd, 4)[0]
+            fb_id   = struct.unpack_from('I', pd, 8)[0]
+            _vlog(f"DRM: plane[{pi}] id={pid} fb_id={fb_id} crtc_id={crtc_id}")
+            if fb_id > 0 and crtc_id > 0:
+                best_fb = fb_id
+                break
+        if best_fb == 0:
+            for pi in range(n_planes):
+                pid = plane_ids[pi]
+                pd[:] = b'\x00' * 32
+                struct.pack_into('I', pd, 0, pid)
+                try:
+                    fcntl.ioctl(self._drm_fd, self._iowr(0xB6, 32), pd)
+                except:
+                    continue
+                fb_id = struct.unpack_from('I', pd, 8)[0]
+                if fb_id > 0:
+                    best_fb = fb_id
+                    _vlog(f"DRM: plane[{pi}] fallback fb_id={fb_id}")
+                    break
+        return best_fb
+
+
+    def _resolve_fb(self, fb_id):
+        fb_info = bytearray(28)
+        struct.pack_into('I', fb_info, 0, fb_id)
+        try:
+            fcntl.ioctl(self._drm_fd, self._iowr(0xAD, 28), fb_info)
+        except Exception as e:
+            _vlog(f"DRM: GETFB fb_id={fb_id} failed: {e}")
+            return self._resolve_fb2(fb_id)
+        w      = struct.unpack_from('I', fb_info, 4)[0]
+        h      = struct.unpack_from('I', fb_info, 8)[0]
+        stride = struct.unpack_from('I', fb_info, 12)[0]
+        bpp    = struct.unpack_from('I', fb_info, 16)[0]
+        handle = struct.unpack_from('I', fb_info, 24)[0]
+        if w == 0 or h == 0:
+            _vlog(f"DRM: GETFB fb_id={fb_id} returned zero dimensions")
+            return self._resolve_fb2(fb_id)
+        self._fb_id = fb_id
+        self._fb_w = w; self._fb_h = h
+        self._fb_stride = stride; self._fb_bpp = bpp; self._fb_handle = handle
+        self.scr_w = w; self.scr_h = h
+        _vlog(f"DRM: GETFB fb_id={fb_id} {w}x{h} stride={stride} "
+              f"bpp={bpp} handle={handle}")
+        return True
+
+    def _resolve_fb2(self, fb_id):
+        fb2 = bytearray(100)
+        struct.pack_into('I', fb2, 0, fb_id)
+        try:
+            fcntl.ioctl(self._drm_fd, self._iowr(0xCE, 100), fb2)
+        except Exception as e:
+            _vlog(f"DRM: GETFB2 fb_id={fb_id} failed: {e}"); return False
+        w      = struct.unpack_from('I', fb2, 4)[0]
+        h      = struct.unpack_from('I', fb2, 8)[0]
+        fmt    = struct.unpack_from('I', fb2, 12)[0]
+        handle = struct.unpack_from('I', fb2, 20)[0]
+        pitch  = struct.unpack_from('I', fb2, 36)[0]
+        if w == 0 or h == 0:
+            _vlog(f"DRM: GETFB2 fb_id={fb_id} returned zero dimensions"); return False
+        bpp = {
+            0x34325258: 32,
+            0x34325241: 32,
+            0x34324258: 32,
+            0x34324241: 32,
+            0x36314752: 16,
+            0x00000000: 32,
+        }.get(fmt, 32)
+        stride = pitch if pitch > 0 else w * (bpp // 8)
+        self._fb_id = fb_id
+        self._fb_w = w; self._fb_h = h
+        self._fb_stride = stride; self._fb_bpp = bpp; self._fb_handle = handle
+        self.scr_w = w; self.scr_h = h
+        _vlog(f"DRM: GETFB2 fb_id={fb_id} {w}x{h} fmt=0x{fmt:08x} "
+              f"stride={stride} handle={handle}")
+        return True
+
+
+    def _try_fb0(self):
+        FBIOGET_VSCREENINFO = 0x4600
+        FBIOGET_FSCREENINFO = 0x4602
+        for fb_path in ('/dev/fb0', '/dev/graphics/fb0'):
+            if not os.path.exists(fb_path): continue
+            try:
+                fd = os.open(fb_path, os.O_RDWR)
+            except Exception as e:
+                _vlog(f"DRM: {fb_path} open failed: {e}"); continue
+            try:
+                vinfo = bytearray(160)
+                fcntl.ioctl(fd, FBIOGET_VSCREENINFO, vinfo)
+                xres = struct.unpack_from('I', vinfo, 0)[0]
+                yres = struct.unpack_from('I', vinfo, 4)[0]
+                bpp  = struct.unpack_from('I', vinfo, 24)[0]
+                if xres == 0 or yres == 0:
+                    os.close(fd); continue
+                finfo = bytearray(80)
+                fcntl.ioctl(fd, FBIOGET_FSCREENINFO, finfo)
+                line_len  = struct.unpack_from('I', finfo, 16)[0]
+                smem_len  = struct.unpack_from('I', finfo, 8)[0]
+                _vlog(f"DRM: {fb_path} {xres}x{yres} bpp={bpp} line={line_len} len={smem_len}")
+                if line_len == 0: line_len = xres * (bpp // 8)
+                if smem_len == 0: smem_len = line_len * yres
+                fb_map = mmap.mmap(fd, smem_len, mmap.MAP_SHARED, mmap.PROT_READ)
+                self._fb0_fd     = fd
+                self._fb_w       = xres;     self._fb_h      = yres
+                self._fb_stride  = line_len; self._fb0_bpp   = bpp
+                self._fb0_smem   = smem_len
+                self._mmap_ptr   = fb_map;   self._mmap_sz   = smem_len
+                self.scr_w = xres; self.scr_h = yres
+                self._mode = 'fb0'
+                register_cleanup(self.close)
+                _vlog(f"DRM: using {fb_path} fallback ({xres}x{yres} bpp={bpp})")
+                return True
+            except Exception as e:
+                _vlog(f"DRM: {fb_path} setup failed: {e}")
+                try: os.close(fd)
+                except: pass
+        return False
+
 
     def _open_drm(self):
         for i in range(4):
             path = f'/dev/dri/card{i}'
             if not os.path.exists(path): continue
-            try: self._drm_fd = os.open(path, os.O_RDWR); break
-            except: continue
-        if self._drm_fd < 0: raise RuntimeError("No DRM device found")
-        res = bytearray(64)
-        struct.pack_into('QQQQ IIII', res, 0, 0,0,0,0, 0,0,0,0)
-        try: fcntl.ioctl(self._drm_fd, self._iowr(0xA0, 64), res)
-        except Exception as e:
-            os.close(self._drm_fd); raise RuntimeError(f"DRM getresources: {e}")
-        n_fb, n_crtc, n_conn, n_enc = struct.unpack_from('IIII', res, 32)
-        if n_crtc == 0: raise RuntimeError("DRM: no CRTCs")
-        fbs = (ctypes.c_uint32 * max(n_fb,1))(); crtcs = (ctypes.c_uint32 * max(n_crtc,1))()
-        conns = (ctypes.c_uint32 * max(n_conn,1))(); encs = (ctypes.c_uint32 * max(n_enc,1))()
-        struct.pack_into('QQQQ IIII', res, 0,
-            ctypes.addressof(fbs), ctypes.addressof(crtcs),
-            ctypes.addressof(conns), ctypes.addressof(encs),
-            n_fb, n_crtc, n_conn, n_enc)
-        fcntl.ioctl(self._drm_fd, self._iowr(0xA0, 64), res)
-        crtc_data = bytearray(128); found = False
-        for ci in range(n_crtc):
-            struct.pack_into('I', crtc_data, 0, crtcs[ci])
             try:
-                fcntl.ioctl(self._drm_fd, self._iowr(0xA1, 128), crtc_data)
-                fb_id = struct.unpack_from('I', crtc_data, 52)[0]
+                self._drm_fd = os.open(path, os.O_RDWR)
+                _vlog(f"DRM: opened {path}")
+                break
+            except Exception as e:
+                _vlog(f"DRM: {path} open failed: {e}")
+                continue
+
+        if self._drm_fd < 0:
+            _vlog("DRM: no /dev/dri/card* found, trying /dev/fb0")
+            if self._try_fb0(): return
+            raise RuntimeError("No DRM device or /dev/fb0 found")
+
+        fb_id = 0
+        try:
+            fb_id, n_crtc = self._find_fb_via_legacy_crtc()
+            if fb_id > 0:
+                _vlog("DRM: found fb via legacy CRTC path")
+        except Exception as e:
+            _vlog(f"DRM: legacy CRTC probe failed: {e}")
+
+        if fb_id == 0:
+            _vlog("DRM: legacy CRTC fb_id=0, trying atomic plane path (Android)")
+            try:
+                fb_id = self._find_fb_via_planes()
                 if fb_id > 0:
-                    self._fb_id = fb_id; found = True; break
-            except: continue
-        if not found: raise RuntimeError("DRM: no active CRTC/framebuffer")
-        fb_info = bytearray(28)
-        struct.pack_into('I', fb_info, 0, self._fb_id)
-        fcntl.ioctl(self._drm_fd, self._iowr(0xAD, 28), fb_info)
-        self._fb_w = struct.unpack_from('I', fb_info, 4)[0]
-        self._fb_h = struct.unpack_from('I', fb_info, 8)[0]
-        self._fb_stride = struct.unpack_from('I', fb_info, 12)[0]
-        self._fb_bpp = struct.unpack_from('I', fb_info, 16)[0]
-        self._fb_handle = struct.unpack_from('I', fb_info, 20)[0]
-        self.scr_w = self._fb_w; self.scr_h = self._fb_h
+                    _vlog(f"DRM: found fb via atomic plane path: fb_id={fb_id}")
+            except Exception as e:
+                _vlog(f"DRM: plane probe failed: {e}")
+
+        if fb_id > 0:
+            if not self._resolve_fb(fb_id):
+                fb_id = 0
+
+        if fb_id == 0:
+            _vlog("DRM: no fb_id found via DRM, falling back to /dev/fb0")
+            if self._try_fb0(): return
+            raise RuntimeError(
+                "DRM: no active framebuffer found.\n"
+                "  Tried: legacy CRTC, atomic KMS planes, /dev/fb0.\n"
+                "  Run drm_diag.py as root to see what the kernel reports.\n"
+                "  On some devices you may need 'setprop persist.drm.cap.atomic 1' "
+                "or a kernel that exposes planes.")
+
         if self._try_mmap_dumb():
             register_cleanup(self.close)
-            _vlog(f"DRM capture: {self._fb_w}x{self._fb_h} (linear mmap)")
+            _vlog(f"DRM capture: {self._fb_w}x{self._fb_h} (linear dumb-buffer mmap)")
             return
         if self._try_gbm():
             register_cleanup(self.close)
-            _vlog(f"DRM capture: {self._fb_w}x{self._fb_h} (GBM de-tiled)")
+            _vlog(f"DRM capture: {self._fb_w}x{self._fb_h} (GBM PRIME de-tiled)")
             return
-        raise RuntimeError("DRM: both linear mmap and GBM failed")
+
+        _vlog("DRM: mmap and GBM both failed, trying /dev/fb0 as last resort")
+        if self._try_fb0(): return
+        raise RuntimeError(
+            "DRM: found framebuffer but could not map it.\n"
+            "  Tried: dumb-buffer mmap, GBM PRIME, /dev/fb0.\n"
+            "  Run drm_diag.py as root for details.")
+
 
     def _try_mmap_dumb(self):
         map_req = bytearray(16)
@@ -1427,69 +1868,116 @@ class DRMCapture:
                                         mmap.MAP_SHARED, mmap.PROT_READ, offset=offset)
             self._mode = 'mmap'; return True
         except Exception as e:
-            _vlog(f"DRM linear mmap failed ({e}), trying GBM...")
+            _vlog(f"DRM: dumb-buffer mmap failed: {e}")
             return False
 
     def _try_gbm(self):
-        try: self._gbm = ctypes.CDLL('libgbm.so.1')
-        except OSError:
-            _vlog("libgbm.so.1 not available"); return False
+        for lib_name in ('libgbm.so.1', 'libgbm.so'):
+            try:
+                self._gbm = ctypes.CDLL(lib_name); break
+            except OSError:
+                continue
+        if not self._gbm:
+            _vlog("DRM: libgbm not available"); return False
         gbm = self._gbm
         gbm.gbm_create_device.argtypes = [ctypes.c_int]
-        gbm.gbm_create_device.restype = ctypes.c_void_p
-        gbm.gbm_bo_import.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
-                                        ctypes.c_void_p, ctypes.c_uint32]
-        gbm.gbm_bo_import.restype = ctypes.c_void_p
-        gbm.gbm_bo_map.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
-                                     ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
-                                     ctypes.POINTER(ctypes.c_uint32),
-                                     ctypes.POINTER(ctypes.c_void_p)]
-        gbm.gbm_bo_map.restype = ctypes.c_void_p
-        gbm.gbm_bo_unmap.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        gbm.gbm_bo_destroy.argtypes = [ctypes.c_void_p]
-        gbm.gbm_device_destroy.argtypes = [ctypes.c_void_p]
+        gbm.gbm_create_device.restype  = ctypes.c_void_p
+        gbm.gbm_bo_import.argtypes     = [ctypes.c_void_p, ctypes.c_uint32,
+                                           ctypes.c_void_p, ctypes.c_uint32]
+        gbm.gbm_bo_import.restype      = ctypes.c_void_p
+        gbm.gbm_bo_map.argtypes        = [ctypes.c_void_p,
+                                           ctypes.c_uint32, ctypes.c_uint32,
+                                           ctypes.c_uint32, ctypes.c_uint32,
+                                           ctypes.c_uint32,
+                                           ctypes.POINTER(ctypes.c_uint32),
+                                           ctypes.POINTER(ctypes.c_void_p)]
+        gbm.gbm_bo_map.restype         = ctypes.c_void_p
+        gbm.gbm_bo_unmap.argtypes      = [ctypes.c_void_p, ctypes.c_void_p]
+        gbm.gbm_bo_destroy.argtypes    = [ctypes.c_void_p]
+        gbm.gbm_device_destroy.argtypes= [ctypes.c_void_p]
         prime_req = bytearray(12)
         struct.pack_into('II', prime_req, 0, self._fb_handle, 2)
-        try: fcntl.ioctl(self._drm_fd, self._iowr(0x2D, 12), prime_req)
+        try:
+            fcntl.ioctl(self._drm_fd, self._iowr(0x2D, 12), prime_req)
         except Exception as e:
-            _vlog(f"PRIME_HANDLE_TO_FD failed: {e}"); return False
+            _vlog(f"DRM: PRIME_HANDLE_TO_FD failed: {e}"); return False
         dmabuf_fd = struct.unpack_from('i', prime_req, 8)[0]
         self._gbm_dev = gbm.gbm_create_device(self._drm_fd)
         if not self._gbm_dev:
-            os.close(dmabuf_fd); return False
+            os.close(dmabuf_fd)
+            _vlog("DRM: gbm_create_device failed"); return False
         fmt = 0x34325258 if self._fb_bpp == 32 else 0x34325241
-        import_data = struct.pack('iIIII', dmabuf_fd, self._fb_w, self._fb_h,
-                                   self._fb_stride, fmt)
-        import_buf = ctypes.create_string_buffer(import_data)
+        import_data = struct.pack('iIIII', dmabuf_fd,
+                                   self._fb_w, self._fb_h, self._fb_stride, fmt)
+        import_buf  = ctypes.create_string_buffer(import_data)
         self._gbm_bo = gbm.gbm_bo_import(self._gbm_dev, 0x5503, import_buf, 0x0001)
         os.close(dmabuf_fd)
         if not self._gbm_bo:
             gbm.gbm_device_destroy(self._gbm_dev); self._gbm_dev = None
-            _vlog("gbm_bo_import failed"); return False
+            _vlog("DRM: gbm_bo_import failed"); return False
         self._mode = 'gbm'; return True
+
 
     def _grab_pixels(self):
         w = self._fb_w; h = self._fb_h; stride = self._fb_stride
-        if self._mode == 'mmap':
+
+        if self._mode in ('mmap', 'fb0'):
             self._mmap_ptr.seek(0)
             raw = self._mmap_ptr.read(self._mmap_sz)
+            bpp = self._fb0_bpp if self._mode == 'fb0' else (self._fb_bpp or 32)
         elif self._mode == 'gbm':
             map_stride = ctypes.c_uint32()
-            map_data = ctypes.c_void_p()
-            ptr = self._gbm.gbm_bo_map(self._gbm_bo, 0, 0, w, h, 0x01,
-                                         ctypes.byref(map_stride), ctypes.byref(map_data))
+            map_data   = ctypes.c_void_p()
+            ptr = self._gbm.gbm_bo_map(
+                self._gbm_bo, 0, 0, w, h, 0x01,
+                ctypes.byref(map_stride), ctypes.byref(map_data))
             if not ptr: return bytes(w * h * 3)
             stride = map_stride.value
             raw = ctypes.string_at(ptr, stride * h)
             self._gbm.gbm_bo_unmap(self._gbm_bo, map_data)
+            bpp = self._fb_bpp or 32
         else:
             return bytes(w * h * 3)
+
         rgb = bytearray(w * h * 3); di = 0
-        for y in range(h):
-            ro = y * stride
-            for x in range(w):
-                si = ro + x * 4
-                rgb[di]=raw[si+2]; rgb[di+1]=raw[si+1]; rgb[di+2]=raw[si]; di+=3
+
+        if bpp == 32:
+            for y in range(h):
+                ro = y * stride
+                for x in range(w):
+                    si = ro + x * 4
+                    rgb[di]   = raw[si+2]
+                    rgb[di+1] = raw[si+1]
+                    rgb[di+2] = raw[si]
+                    di += 3
+        elif bpp == 16:
+            for y in range(h):
+                ro = y * stride
+                for x in range(w):
+                    si = ro + x * 2
+                    px = raw[si] | (raw[si+1] << 8)
+                    rgb[di]   = (px >> 11 & 0x1F) * 255 // 31
+                    rgb[di+1] = (px >> 5  & 0x3F) * 255 // 63
+                    rgb[di+2] = (px       & 0x1F) * 255 // 31
+                    di += 3
+        elif bpp == 24:
+            for y in range(h):
+                ro = y * stride
+                for x in range(w):
+                    si = ro + x * 3
+                    rgb[di]   = raw[si+2]
+                    rgb[di+1] = raw[si+1]
+                    rgb[di+2] = raw[si]
+                    di += 3
+        else:
+            bsize = bpp // 8 or 4
+            for y in range(h):
+                ro = y * stride
+                for x in range(w):
+                    si = ro + x * bsize
+                    v = raw[si+2] if bsize >= 3 else raw[si]
+                    rgb[di] = rgb[di+1] = rgb[di+2] = v; di += 3
+
         return bytes(rgb)
 
     def grab(self, force_keyframe=False):
@@ -1503,7 +1991,8 @@ class DRMCapture:
                     si = ro + x * 3
                     out[di]=rgb_full[si]; out[di+1]=rgb_full[si+1]; out[di+2]=rgb_full[si+2]; di+=3
             rgb = bytes(out)
-        else: rgb = rgb_full
+        else:
+            rgb = rgb_full
         first_row = 0; row_count = out_h
         if force_keyframe or self.prev_rgb is None or len(rgb) != len(self.prev_rgb):
             compressed = zlib.compress(rgb, 6); mode = 1
@@ -1516,7 +2005,7 @@ class DRMCapture:
         return compressed, mode, out_w, out_h, fid, first_row, row_count
 
     def close(self):
-        if self._mode == 'mmap' and self._mmap_ptr:
+        if self._mode in ('mmap', 'fb0') and self._mmap_ptr:
             try: self._mmap_ptr.close()
             except: pass
         elif self._mode == 'gbm':
@@ -1526,19 +2015,21 @@ class DRMCapture:
             if self._gbm_dev:
                 try: self._gbm.gbm_device_destroy(self._gbm_dev)
                 except: pass
+        if self._fb0_fd >= 0:
+            try: os.close(self._fb0_fd)
+            except: pass
+            self._fb0_fd = -1
         if self._drm_fd >= 0:
             try: os.close(self._drm_fd)
             except: pass
             self._drm_fd = -1
 
 class FileBuffer:
-    """Caches a file for chunked download serving."""
     def __init__(self):
         self.file_id = -1; self.filename = ''
         self.data = b''; self.chunks = []
 
     def load(self, path, chunk_sz):
-        """Read file from disk and chunk it. Returns (success, error_msg)."""
         try:
             rpath = os.path.realpath(path)
             if not os.path.isfile(rpath):
@@ -1567,7 +2058,6 @@ class FileBuffer:
         return b''
 
 class UploadReceiver:
-    """Receives chunked file uploads from client."""
     def __init__(self):
         self.file_id = -1; self.filename = ''
         self.total_size = 0; self.num_chunks = 0
@@ -1953,7 +2443,6 @@ def build_raw_reply(icmp, req_type, reply_type, has_id, magic_extra,
     return bytes(reply)
 
 def build_raw_hs_reply(icmp, server_nonce, server_pub, req_type, reply_type, has_id, magic_extra):
-    """Build handshake reply using the same ICMP type family as the request."""
     payload = MAGIC + b'VNC4' + server_nonce + server_pub
     hdr_sz = 8 + magic_extra
     r = bytearray(icmp[:hdr_sz]) + payload
@@ -1990,7 +2479,6 @@ def _v6_icmpv6_ck(umem, d, ico, total):
     struct.pack_into('!H', umem, d+ico+2, cksum(ph + umem[d+ico:d+total]))
 
 def xdp_build_hs_reply(frame, server_nonce, server_pub, req_type, reply_type, has_id, magic_extra):
-    """Build XDP handshake reply using the same ICMP type family as the request."""
     r = bytearray(frame)
     dm = r[0:6]; sm = r[6:12]; r[0:6] = sm; r[6:12] = dm
     si = r[26:30]; di_ = r[30:34]; r[26:30] = di_; r[30:34] = si; r[22] = 64
@@ -2034,15 +2522,86 @@ def xdp_build_reply(umem, sa, sl, fi, req_type, reply_type, has_id, magic_extra,
     else: _v4_icmp_ck(umem, d, ico, total)
     return total
 
+class ShellManager:
+    def __init__(self):
+        self.pty_master = -1
+        self.proc = None
+        self._q = queue.Queue()
+        self._running = False
+        self._thread = None
+
+    def open(self, shell='/bin/bash'):
+        self.pty_master, pty_slave = os.openpty()
+        try:
+            import termios
+            fcntl.ioctl(pty_slave, termios.TIOCSWINSZ,
+                        struct.pack('HHHH', 24, 80, 0, 0))
+        except Exception: pass
+        env = os.environ.copy()
+        env['TERM'] = 'dumb'
+        env['NO_COLOR'] = '1'
+        self.proc = subprocess.Popen(
+            [shell, '-i'],
+            stdin=pty_slave, stdout=pty_slave, stderr=pty_slave,
+            close_fds=True, start_new_session=True, env=env)
+        os.close(pty_slave)
+        self._running = True
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+
+    def _reader(self):
+        while self._running:
+            try:
+                r, _, _ = select.select([self.pty_master], [], [], 0.05)
+                if r:
+                    d = os.read(self.pty_master, 4096)
+                    if d: self._q.put(d)
+                if self.proc and self.proc.poll() is not None:
+                    self._running = False; break
+            except OSError: break
+
+    def write(self, data):
+        if self.pty_master >= 0:
+            try: os.write(self.pty_master, data)
+            except OSError: pass
+
+    def get_output(self):
+        chunks = []
+        try:
+            while True: chunks.append(self._q.get_nowait())
+        except queue.Empty: pass
+        return b''.join(chunks)
+
+    def is_alive(self):
+        return self._running and (self.proc is None or self.proc.poll() is None)
+
+    def close(self):
+        self._running = False
+        if self.proc:
+            try: self.proc.terminate()
+            except: pass
+            try: self.proc.wait(timeout=2)
+            except:
+                try: self.proc.kill()
+                except: pass
+        if self.pty_master >= 0:
+            try: os.close(self.pty_master)
+            except: pass
+            self.pty_master = -1
+        self.proc = None
+
+
 class ICMPVNCServer:
-    def __init__(self, iface, mode, psk, scale, drop_other):
+    def __init__(self, iface, mode, psk, scale, drop_other, mobile=False):
         self.iface = iface; self.mode = mode
         self.crypto = CryptoV3(psk); self.scale = scale
         self.drop_other = drop_other
+        self.mobile = mobile
         self.input_backend = None
         self._shutdown_requested = False
         self.client_ip = None; self.client_time = 0
         self.transport = None; self.capture = None
+        self.shell_mgr = None; self.shell_crypto = None
         self.fbuf = FrameBuffer()
         self.kf_buf = FrameBuffer()
         self.file_buf = FileBuffer()
@@ -2065,6 +2624,9 @@ class ICMPVNCServer:
     def _disconnect(self, ip_str):
         if ip_str == self.client_ip:
             _event("✗", f"Client {ip_str} disconnected", _C.YELLOW)
+            if self.shell_mgr:
+                self.shell_mgr.close(); self.shell_mgr = None
+            self.shell_crypto = None
             self.client_ip = None; self.client_time = 0
             self.crypto = CryptoV3(self.crypto.psk)
             self.capture.prev_rgb = None
@@ -2166,6 +2728,41 @@ class ICMPVNCServer:
                 elif etype == 3:
                     self.input_backend.inject_scroll(btn)
             return b'\x01'
+        elif cmd == CMD_SHELL_OPEN:
+            if len(data) < 48:
+                return b'\x00Bad payload'
+            client_pub = data[:32]; shell_cn = data[32:48]
+            sc = CryptoV4(self.crypto.psk)
+            srv_pub = sc.generate_dh()
+            shell_sn = os.urandom(16)
+            sc.derive(shell_cn, shell_sn, client_pub, srv_pub)
+            if self.shell_mgr:
+                self.shell_mgr.close(); self.shell_mgr = None
+            sh = next((s for s in ('/bin/bash', '/usr/bin/bash', '/bin/sh')
+                        if os.path.exists(s)), None)
+            if not sh:
+                return b'\x00No shell found'
+            self.shell_mgr = ShellManager()
+            self.shell_mgr.open(sh)
+            self.shell_crypto = sc
+            _event("⚡", f"Shell: {sh} ({src_ip})", _C.GREEN)
+            return b'\x01' + srv_pub + shell_sn
+        elif cmd == CMD_SHELL_INPUT:
+            if not self.shell_crypto:
+                return b''
+            raw = self.shell_crypto.decrypt(data)
+            if raw and raw != b'\x00' and self.shell_mgr and self.shell_mgr.is_alive():
+                self.shell_mgr.write(raw)
+            out = self.shell_mgr.get_output() if self.shell_mgr else b''
+            return self.shell_crypto.encrypt(out if out else b'')
+        elif cmd == CMD_SHELL_CLOSE:
+            if self.shell_mgr:
+                self.shell_mgr.close(); self.shell_mgr = None
+            self.shell_crypto = None
+            _event("⚡", "Shell closed", _C.YELLOW)
+            return b'\x01'
+        elif cmd == CMD_PING:
+            return data
         return b''
 
     def _print_status(self):
@@ -2321,45 +2918,76 @@ class ICMPVNCServer:
         ip4, mac, ip6 = get_iface_info(self.iface)
         _compile_native()
         self.capture = None; capture_label = 'NONE'
-        if os.environ.get('DISPLAY'):
-            try:
-                self.capture = ScreenCapture(self.scale)
-                cap = self.capture
-                if cap.use_shm:
-                    shm_labels = {'xcb_fd': 'SHM/xcb-fd', 'memfd': 'SHM/memfd', 'sysv': 'SHM/SysV'}
-                    capture_label = f"X11 {shm_labels.get(cap._shm_method, 'SHM')}"
-                else:
-                    capture_label = 'X11 XGetImage'
-                wl = os.environ.get('WAYLAND_DISPLAY')
-                if wl: capture_label += ' (via XWayland)'
-            except Exception as e:
-                _vlog(f"X11 capture failed: {e}")
-                self.capture = None
-        if not self.capture:
-            try:
-                self.capture = PipeWireCapture(self.scale)
-                capture_label = 'PipeWire (GStreamer)'
-            except Exception as e:
-                _vlog(f"PipeWire capture failed: {e}")
-        if not self.capture:
-            try:
-                self.capture = DRMCapture(self.scale)
-                capture_label = 'DRM/KMS framebuffer'
-            except Exception as e:
-                _vlog(f"DRM capture failed: {e}")
-        if not self.capture:
-            _event("✗", "No capture backend available — cannot start.", _C.BRED)
-            sys.exit(1)
+
+        if self.mobile:
+            _vlog("Mobile mode: trying capture backends (screencap → DRM → /dev/fb0)")
+            self.scale = 1
+            mobile_backends = [
+                ('screencap (SurfaceControl)', lambda: ScreencapCapture(scale=1)),
+                ('DRM/KMS + /dev/fb0',         lambda: DRMCapture(scale=1)),
+            ]
+            for label, factory in mobile_backends:
+                try:
+                    self.capture = factory()
+                    capture_label = f'{label} (mobile)'
+                    _vlog(f"Mobile capture: using {label}")
+                    break
+                except Exception as e:
+                    _vlog(f"Mobile backend [{label}] failed: {e}")
+            if not self.capture:
+                _event("✗", "All mobile capture backends failed.", _C.BRED)
+                _event("!", "Run: sudo python3 drm_diag.py  for diagnostics", _C.GOLD)
+                _event("!", "Ensure screencap exists:  ls -la /system/bin/screencap", _C.GOLD)
+                sys.exit(1)
+        else:
+            if os.environ.get('DISPLAY'):
+                try:
+                    self.capture = ScreenCapture(self.scale)
+                    cap = self.capture
+                    if cap.use_shm:
+                        shm_labels = {'xcb_fd': 'SHM/xcb-fd', 'memfd': 'SHM/memfd', 'sysv': 'SHM/SysV'}
+                        capture_label = f"X11 {shm_labels.get(cap._shm_method, 'SHM')}"
+                    else:
+                        capture_label = 'X11 XGetImage'
+                    wl = os.environ.get('WAYLAND_DISPLAY')
+                    if wl: capture_label += ' (via XWayland)'
+                except Exception as e:
+                    _vlog(f"X11 capture failed: {e}")
+                    self.capture = None
+            if not self.capture:
+                try:
+                    self.capture = PipeWireCapture(self.scale)
+                    capture_label = 'PipeWire (GStreamer)'
+                except Exception as e:
+                    _vlog(f"PipeWire capture failed: {e}")
+            if not self.capture:
+                _is_android = (os.path.exists('/system/bin/screencap') or
+                               os.path.exists('/system/bin/surfaceflinger'))
+                if _is_android:
+                    _event("✗", "Android device detected without --mobile flag.", _C.BRED)
+                    _event("!", "DRM capture on Android without --mobile may reboot the device.", _C.GOLD)
+                    _event("!", "Use: sudo python3 server.py -i wlan0 --raw -k KEY --mobile", _C.GOLD)
+                    sys.exit(1)
+                try:
+                    self.capture = DRMCapture(self.scale)
+                    capture_label = 'DRM/KMS framebuffer'
+                except Exception as e:
+                    _vlog(f"DRM capture failed: {e}")
+            if not self.capture:
+                _event("✗", "No capture backend available — cannot start.", _C.BRED)
+                sys.exit(1)
+
         self.input_backend = None
         try:
             self.input_backend = UInputBackend(self.capture.scr_w, self.capture.scr_h)
         except Exception as e:
             _vlog(f"uinput failed: {e}")
-        if not self.input_backend and hasattr(self.capture, 'x11') and hasattr(self.capture, 'display'):
-            try:
-                self.input_backend = XTestInputBackend(self.capture.x11, self.capture.display)
-            except Exception as e:
-                _vlog(f"XTest failed: {e}")
+        if not self.input_backend and not self.mobile:
+            if hasattr(self.capture, 'x11') and hasattr(self.capture, 'display'):
+                try:
+                    self.input_backend = XTestInputBackend(self.capture.x11, self.capture.display)
+                except Exception as e:
+                    _vlog(f"XTest failed: {e}")
         if not self.input_backend:
             _vlog("Input: no backend available — view-only")
 
@@ -2368,7 +2996,7 @@ class ICMPVNCServer:
         mode_str = 'XDP (native)' if self.mode == 'xdp' else 'Raw Socket'
         scr_str = (f"{self.capture.scr_w}x{self.capture.scr_h} → "
                    f"{self.capture.scr_w//self.scale}x{self.capture.scr_h//self.scale}")
-        _tunnel_box("Server", [
+        rows = [
             ("Mode",       mode_str),
             ("Interface",  f"{self.iface} ({ip4})"),
             ("Capture",    f"{capture_label} · {scr_str}"),
@@ -2377,7 +3005,10 @@ class ICMPVNCServer:
             ("Key Ex",     "X25519 ECDH + PSK"),
             ("Encoding",   f"zlib delta · {self.chunk_sz}B chunks"),
             ("Session",    f"0x{SESSION_ID:04X}"),
-        ])
+        ]
+        if self.mobile:
+            rows.insert(2, ("Display", "Mobile/DRM direct (no X11/KeX)"))
+        _tunnel_box("Server", rows)
         caps = ["screen"]
         if self.input_backend:
             caps.extend(["keyboard", "mouse"])
@@ -2413,13 +3044,24 @@ def main():
         epilog="Examples:\n"
                "  sudo -E python3 server.py -i eth0 --xdp -k mysecret\n"
                "  sudo -E python3 server.py -i eth0 --xdp --drop -k mysecret\n"
-               "  sudo -E python3 server.py -i wlan0 --raw -k mysecret --scale 2\n")
+               "  sudo -E python3 server.py -i wlan0 --raw -k mysecret --scale 2\n"
+               "  sudo python3 server.py -i wlan0 --raw -k mysecret --mobile\n"
+               "\nMobile mode (--mobile):\n"
+               "  Captures the Android display via DRM/KMS or /dev/fb0.\n"
+               "  No X11, KeX, or display server required. Root required.\n"
+               "  Run drm_diag.py first if capture fails.\n")
     p.add_argument('-i', '--interface', required=True, help='Network interface')
     p.add_argument('-k', '--key', default=None, help='Pre-shared key')
-    p.add_argument('--scale', type=int, default=2, help='Downscale 1-6 (default: 2)')
-    p.add_argument('--drop', action='store_true', help='XDP: drop TCP/UDP. Raw: suppress echo')
-    p.add_argument('-v', '--verbose', action='store_true', help='Show detailed subsystem init')
-    p.add_argument('-q', '--quiet', action='store_true', help='Errors only (no banner/status)')
+    p.add_argument('--scale', type=int, default=2,
+                   help='Downscale factor 1-6 (default: 2; overridden to 1 in --mobile)')
+    p.add_argument('--drop', action='store_true',
+                   help='XDP: drop non-ICMP traffic. Raw: suppress kernel echo')
+    p.add_argument('--mobile', action='store_true',
+                   help='Mobile mode: force DRM/KMS + /dev/fb0 capture, uinput only, scale=1. '
+                        'Use on rooted Android/NetHunter to share the real device screen.')
+    p.add_argument('-v', '--verbose', action='store_true',
+                   help='Show detailed subsystem init (capture paths, ioctl results)')
+    p.add_argument('-q', '--quiet', action='store_true', help='Errors only')
     p.add_argument('--no-color', action='store_true', help='Disable ANSI colors')
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument('--xdp', action='store_const', const='xdp', dest='mode')
@@ -2433,7 +3075,8 @@ def main():
         warn_wireless_xdp(a.interface)
     psk = a.key or getpass.getpass("Pre-shared key: ")
     if not psk: _event("✗", "Key required", _C.BRED); sys.exit(1)
-    ICMPVNCServer(a.interface, a.mode, psk, max(1, min(6, a.scale)), a.drop).run()
+    ICMPVNCServer(a.interface, a.mode, psk, max(1, min(6, a.scale)), a.drop,
+                  mobile=a.mobile).run()
 
 if __name__ == '__main__':
     main()
