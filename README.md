@@ -12,7 +12,7 @@ This is a 100% ICMP based VNC for desktop or mobile devices, featuring screen sh
 - Capture fallback: xcb_shm_attach_fd (X11) --> XShmAttachFd --> SysV IPC + XShmAttach --> XGetImage --> PipeWire + GStreamer (Wayland) --> DRM/KMS (ARM/VM)
 - Input fallback: uinput --> XTest
 - DRM/KMS Direct GPU Framebuffer access, linear for ARM/VM, X-Y tiling for Intel/AMD64 (non Nvidia GPUs)
-- A full eBPF/XDP program assembled as raw bytecode from Python enabling linux network stack bypassing (partial kernel bypass)
+- Dual path eBPF/XDP: prebuilt C eBPF object loaded via libbpf, falls back to Python raw bytecode if libbpf is unavailable, to enabling linux network stack bypassing (partial kernel bypass)
 - Adaptive delta compression with bidirectional dirty row scanning
 - Tkinter based live viewing 
 - An extensive !command system for controlling VNC
@@ -31,6 +31,7 @@ This is a 100% ICMP based VNC for desktop or mobile devices, featuring screen sh
 - Python 3.6+ (standard libraries, no pip installs needed, this is pure python except for Native C Helper)
 - Tkinter (Most Python installs already include; check with 'python3 -m tkinter')
 - Linux kernel 4.18+ (recommended for full XDP performance)
+- libbpf for prebuilt C eBPF 
 
 ## Installation
 Clone the repository
