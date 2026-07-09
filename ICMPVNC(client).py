@@ -655,6 +655,184 @@ def load_xdp_prog(prog):
     if fd<0: raise OSError(ctypes.get_errno(),"prog load failed")
     return fd
 
+_XDP_BPF_O_B64 = (
+    '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'
+)
+
+def _embedded_bpf_object():
+    import base64
+    return zlib.decompress(base64.b64decode(_XDP_BPF_O_B64))
+
+def _try_load_xdp_c(map_fd, drop_other=False):
+    import resource
+    try:
+        resource.setrlimit(resource.RLIMIT_MEMLOCK, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+    except Exception:
+        pass
+    lib = None
+    for name in ('libbpf.so.1', 'libbpf.so'):
+        try:
+            lib = ctypes.CDLL(name)
+            break
+        except OSError:
+            continue
+    if lib is None:
+        raise RuntimeError("libbpf not found")
+
+    lib.bpf_object__open_mem.restype = ctypes.c_void_p
+    lib.bpf_object__open_mem.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+    lib.bpf_object__load.argtypes = [ctypes.c_void_p]
+    lib.bpf_object__load.restype = ctypes.c_int
+    lib.bpf_object__close.argtypes = [ctypes.c_void_p]
+    lib.bpf_object__find_map_by_name.restype = ctypes.c_void_p
+    lib.bpf_object__find_map_by_name.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.bpf_object__find_program_by_name.restype = ctypes.c_void_p
+    lib.bpf_object__find_program_by_name.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.bpf_map__reuse_fd.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.bpf_map__reuse_fd.restype = ctypes.c_int
+    lib.bpf_map__fd.argtypes = [ctypes.c_void_p]
+    lib.bpf_map__fd.restype = ctypes.c_int
+    lib.bpf_program__fd.argtypes = [ctypes.c_void_p]
+    lib.bpf_program__fd.restype = ctypes.c_int
+    try:
+        lib.libbpf_set_print(None)
+    except Exception:
+        pass
+
+    raw = _embedded_bpf_object()
+    buf = (ctypes.c_char * len(raw)).from_buffer_copy(raw)
+    obj = lib.bpf_object__open_mem(buf, len(raw), None)
+    if not obj:
+        raise OSError("bpf_object__open_mem failed")
+    try:
+        xsk = lib.bpf_object__find_map_by_name(obj, b"xsk_map")
+        if not xsk:
+            raise OSError("xsk_map not found in object")
+        if lib.bpf_map__reuse_fd(xsk, map_fd) != 0:
+            raise OSError("bpf_map__reuse_fd failed")
+        if lib.bpf_object__load(obj) != 0:
+            raise OSError("bpf_object__load failed")
+        cfg = lib.bpf_object__find_map_by_name(obj, b"cfg")
+        if cfg:
+            cfd = lib.bpf_map__fd(cfg)
+            if cfd >= 0:
+                class _UA(ctypes.Structure):
+                    _fields_ = [('mf', ctypes.c_uint32), ('p', ctypes.c_uint32),
+                                ('k', ctypes.c_uint64), ('v', ctypes.c_uint64),
+                                ('fl', ctypes.c_uint64)]
+                kv = ctypes.c_uint32(0)
+                vv = ctypes.c_uint32(1 if drop_other else 0)
+                ua = _UA(); ua.mf = cfd
+                ua.k = ctypes.addressof(kv); ua.v = ctypes.addressof(vv)
+                bpf_syscall(BPF_MAP_UPDATE_ELEM, ua, ctypes.sizeof(ua))
+        prog = lib.bpf_object__find_program_by_name(obj, b"icmpvnc_xdp")
+        if not prog:
+            raise OSError("icmpvnc_xdp program not found")
+        pfd = lib.bpf_program__fd(prog)
+        if pfd < 0:
+            raise OSError("invalid program fd")
+        return os.dup(pfd)
+    finally:
+        lib.bpf_object__close(obj)
+
+def load_xdp_program(map_fd, drop_other=False):
+    try:
+        pfd = _try_load_xdp_c(map_fd, drop_other)
+        _vlog("XDP: C eBPF loaded (prebuilt)")
+        return pfd
+    except Exception as e:
+        _vlog(f"XDP: C eBPF unavailable ({e}); using pure-Python bytecode")
+        return load_xdp_prog(build_xdp_bytecode(map_fd))
+
 def update_xsk_map(mfd,k,xfd):
     class A(ctypes.Structure):
         _fields_=[('mf',ctypes.c_uint32),('p',ctypes.c_uint32),('k',ctypes.c_uint64),('v',ctypes.c_uint64),('fl',ctypes.c_uint64)]
@@ -694,7 +872,7 @@ class XDPTransport:
         register_cleanup(self.close)
 
     def setup(self):
-        self.map_fd=create_xsk_map(); self.prog_fd=load_xdp_prog(build_xdp_bytecode(self.map_fd))
+        self.map_fd=create_xsk_map(); self.prog_fd=load_xdp_program(self.map_fd, False)
         attach_xdp(self.ifidx,self.prog_fd)
         self.umem_fd=libc.memfd_create(b'umem',0); libc.ftruncate(self.umem_fd,self.umem_sz)
         self.umem=mmap.mmap(self.umem_fd,self.umem_sz,mmap.MAP_SHARED|mmap.MAP_POPULATE,mmap.PROT_READ|mmap.PROT_WRITE)
@@ -1792,6 +1970,7 @@ class ICMPVNCClient:
         self.shell_active = False
         self.shell_crypto = None
         self._shell_input_queue = collections.deque()
+        self._shell_last_poll = 0.0
         ti = ICMP_TYPES[args.type]
         self.req_type = ti[0]; self.reply_type = ti[1]
         self.type_name = ti[2]; self.has_id = ti[3]; self.magic_extra = ti[4]
@@ -1804,8 +1983,6 @@ class ICMPVNCClient:
         self._input_queue = collections.deque(maxlen=512)
         self._bg_download = None
         self._bg_upload = None
-        self._bg_shell = None
-        self._bg_ping = None
         self.kf_consecutive_fails = 0
         self.kf_force_next = True
         self.kf_backoff_until = 0; self.kf_original_rate = 0
@@ -1853,10 +2030,13 @@ class ICMPVNCClient:
         self._send_cmd(CMD_SHELL_OPEN, 0, client_pub + shell_cn)
         deadline = time.time() + 5.0
         while time.time() < deadline:
+            self._recv_replies()
             try:
-                item = self._shell_reply_queue.get(timeout=0.1)
-                rcmd = item[1]
-                if rcmd == CMD_SHELL_OPEN:
+                while True:
+                    item = self._shell_reply_queue.get_nowait()
+                    rcmd = item[1]
+                    if rcmd != CMD_SHELL_OPEN:
+                        continue
                     rdata = item[2]
                     plain = self.crypto.decrypt(rdata)
                     if plain and len(plain) >= 49 and plain[0] == 0x01:
@@ -1872,18 +2052,8 @@ class ICMPVNCClient:
                         return f"[!] Shell error: {plain[1:].decode('utf-8','replace')}"
             except queue.Empty:
                 pass
-            self._wait_fd(0.1)
+            self._wait_fd(0.05)
         return "[!] Shell handshake timed out"
-
-    def _start_bg_shell(self):
-        if self._bg_shell: return "[!] Shell handshake already in progress"
-        self._bg_shell = {'done': False, 'result': None}
-        bg = self._bg_shell
-        def _run():
-            bg['result'] = self._shell_handshake()
-            bg['done'] = True
-        threading.Thread(target=_run, daemon=True, name='ShellHandshake').start()
-        return None
 
     def _do_ping_inline(self):
         seq = self.seq; self.seq += 1
@@ -1891,10 +2061,13 @@ class ICMPVNCClient:
         self._send_cmd(CMD_PING, seq, struct.pack('!d', t0))
         deadline = t0 + 3.0
         while time.time() < deadline:
+            self._recv_replies()
             try:
-                item = self._ping_reply_queue.get(timeout=0.1)
-                rcmd = item[1]
-                if rcmd == CMD_PING:
+                while True:
+                    item = self._ping_reply_queue.get_nowait()
+                    rcmd = item[1]
+                    if rcmd != CMD_PING:
+                        continue
                     rdata = item[2]
                     plain = self.crypto.decrypt(rdata)
                     if plain and len(plain) >= 8:
@@ -1904,16 +2077,6 @@ class ICMPVNCClient:
             except queue.Empty:
                 pass
             self._wait_fd(0.05)
-        return None
-
-    def _start_bg_ping(self):
-        if self._bg_ping: return "[!] Ping already in progress"
-        self._bg_ping = {'done': False, 'result': None}
-        bg = self._bg_ping
-        def _run():
-            bg['result'] = self._do_ping_inline()
-            bg['done'] = True
-        threading.Thread(target=_run, daemon=True, name='PingInline').start()
         return None
 
     def _write_shell_output(self, data):
@@ -1932,6 +2095,46 @@ class ICMPVNCClient:
                 for line in clean.splitlines():
                     if line.strip(): self._log(line)
             except Exception: pass
+
+    def _service_shell(self):
+        """Poll remote shell I/O without monopolizing the frame loop.
+
+        Shell replies are diverted into _shell_reply_queue by _recv_replies();
+        frame traffic continues on the main path. Empty keepalives are throttled
+        so shell polling does not starve video bandwidth.
+        """
+        if not self.shell_active:
+            return
+        sc = self.shell_crypto
+        if sc is None:
+            self.shell_active = False
+            return
+        pending = b''
+        try:
+            while self._shell_input_queue:
+                pending += self._shell_input_queue.popleft()
+        except IndexError:
+            pass
+        now = time.time()
+        # Immediate send when the user typed; otherwise poll for output ~20 Hz
+        if pending or (now - self._shell_last_poll) >= 0.05:
+            self._shell_last_poll = now
+            enc = sc.encrypt(pending if pending else b'\x00')
+            self._send_cmd(CMD_SHELL_INPUT, self.seq, enc)
+            self.seq += 1
+        # Drain diverted shell replies (also catches replies received during frame I/O)
+        while True:
+            try:
+                item = self._shell_reply_queue.get_nowait()
+                _, rcmd, rdata, _ = item
+                if rcmd == CMD_SHELL_INPUT:
+                    outer = self.crypto.decrypt(rdata)
+                    if outer:
+                        inner = sc.decrypt(outer)
+                        if inner and inner != b'\x00':
+                            self._write_shell_output(inner)
+            except queue.Empty:
+                break
 
     def _recv_replies_raw(self):
         now = time.time(); out = []; rt = self.reply_type
@@ -2532,8 +2735,7 @@ class ICMPVNCClient:
                 while not self._cmd_queue.empty():
                     cmd_item = self._cmd_queue.get_nowait()
                     if cmd_item[0] == 'ping':
-                        r = self._start_bg_ping()
-                        if r: self._cmd_result.put(r)
+                        self._cmd_result.put(self._do_ping_inline())
                     elif cmd_item[0] == 'download':
                         self._cmd_result.put(self._start_bg_download(cmd_item[1]))
                     elif cmd_item[0] == 'upload':
@@ -2552,17 +2754,8 @@ class ICMPVNCClient:
                         else:
                             self._cmd_result.put("[!] Reconnect failed")
                     elif cmd_item[0] == 'shell':
-                        r = self._start_bg_shell()
-                        if r: self._cmd_result.put(r)
+                        self._cmd_result.put(self._shell_handshake())
             except queue.Empty: pass
-
-            if self._bg_ping and self._bg_ping['done']:
-                self._cmd_result.put(self._bg_ping['result'])
-                self._bg_ping = None
-
-            if self._bg_shell and self._bg_shell['done']:
-                self._cmd_result.put(self._bg_shell['result'])
-                self._bg_shell = None
 
             while self._input_queue:
                 try:
@@ -2573,38 +2766,9 @@ class ICMPVNCClient:
 
             self._service_bg_transfers()
 
-            if self.shell_active:
-                sc = self.shell_crypto
-                if sc is None:
-                    self.shell_active = False
-                else:
-                    pending = b''
-                    try:
-                        while self._shell_input_queue:
-                            pending += self._shell_input_queue.popleft()
-                    except IndexError: pass
-                    enc = sc.encrypt(pending if pending else b'\x00')
-                    self._send_cmd(CMD_SHELL_INPUT, self.seq, enc)
-                    self.seq += 1
-
-                    self._recv_replies()  # populate _shell_reply_queue from transport (shell replies diverted; frame replies ignored in shell mode)
-
-                    # Option Y: drain from dedicated queue instead of _recv_replies()
-                    while True:
-                        try:
-                            item = self._shell_reply_queue.get_nowait()
-                            _, rcmd, rdata, _ = item
-                            if rcmd == CMD_SHELL_INPUT:
-                                outer = self.crypto.decrypt(rdata)
-                                if outer:
-                                    inner = sc.decrypt(outer)
-                                    if inner and inner != b'\x00':
-                                        self._write_shell_output(inner)
-                        except queue.Empty:
-                            break
-
-                    self._wait_fd(0.01)
-                    continue
+            # Shell I/O shares the session with video; do not continue/skip frames.
+            # (Previously shell_active took over the loop until !exit, freezing video.)
+            self._service_shell()
 
             if time.time() < self.kf_backoff_until: time.sleep(0.1); continue
 
