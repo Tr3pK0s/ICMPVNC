@@ -12,13 +12,13 @@ This is a 100% ICMP based VNC for desktop or mobile devices, featuring screen sh
 - Capture fallback: xcb_shm_attach_fd (X11) --> XShmAttachFd --> SysV IPC + XShmAttach --> XGetImage --> PipeWire + GStreamer (Wayland) --> DRM/KMS (ARM/VM)
 - Input fallback: uinput --> XTest
 - DRM/KMS Direct GPU Framebuffer access, linear for ARM/VM, X-Y tiling for Intel/AMD64 (non Nvidia GPUs)
-- Dual path eBPF/XDP: prebuilt C eBPF object loaded via libbpf, falls back to Python raw bytecode if libbpf is unavailable, to enabling linux network stack bypassing (partial kernel bypass)
+- Dual path eBPF/XDP, prebuilt C eBPF object loaded via libbpf, falls back to Python raw bytecode if libbpf is unavailable (enables network stack bypassing, a partial kernel bypass)
 - Adaptive delta compression with bidirectional dirty row scanning
 - Tkinter based live viewing 
 - An extensive !command system for controlling VNC
 - Background file transfers, uninterrupted streaming/input
-- PNG encoder capable of screenshots or recording frames (24bit RGB PNG assembler using zlib compressed IDAT chunks) 
-- GIF animator (216 color quantization --> LZW --> GIF89a)
+- PNG encoder capable of screenshots or recording frames  
+- GIF animator
 - Nethunter/Android support
 
 ### Native Helper
