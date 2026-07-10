@@ -31,7 +31,7 @@ This is a 100% ICMP based VNC for desktop or mobile devices, featuring screen sh
 - Python 3.6+ (standard libraries, no pip installs needed, this is pure python except for Native C Helper)
 - Tkinter (Most Python installs already include; check with 'python3 -m tkinter')
 - Linux kernel 4.18+ (recommended for full XDP performance)
-- libbpf for prebuilt C eBPF 
+- libbpf for prebuilt C eBPF, python bytecode fallback 
 
 ## Installation
 Clone the repository
